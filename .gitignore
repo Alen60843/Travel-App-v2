@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-test/
+.env
+.env.local
+*.log
+.DS_Store
+.claude/settings.local.json
+.turbo/
+coverage/
