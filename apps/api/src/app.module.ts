@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 
-import { AuthModule, FirebaseSocketAuthenticator } from './auth';
+import { AuthModule } from './auth';
+import { ChatModule } from './chat';
 import { ConfigModule } from './config/config.module';
 import { ConsentModule } from './consent';
 import { DatabaseModule } from './database/database.module';
@@ -15,11 +16,11 @@ import { OutboxModule } from './outbox/outbox.module';
 import { QueueModule } from './queue/queue.module';
 import { RedisModule } from './redis/redis.module';
 import { RedisReadinessCheck } from './redis/redis-readiness.check';
-import { RealtimeModule } from './realtime/realtime.module';
-import { SOCKET_AUTHENTICATOR } from './realtime/socket-authenticator';
+import { realtimeModule } from './realtime-wiring';
 import { SettingsModule } from './settings';
 import { SwipesModule } from './swipes';
 import { TripsModule } from './trips';
+import { TrustModule } from './trust';
 import { UsersModule } from './users';
 
 /**
@@ -57,9 +58,10 @@ export class ReadinessRegistryModule {}
  * Root module — the composition root, owned by the Lead.
  *
  * Phase 2 wires infrastructure; Phases 3–5 add their approved domain modules.
- * Phase 6 Workstream A adds the USER-hosted Events lifecycle. Chat,
- * Marketplace, Payments, Trust and Safety remain intentionally absent until
- * their approved phases.
+ * Phase 6 Workstream A adds the USER-hosted Events lifecycle. Phase 8 adds
+ * Trust & Reviews (traveller <-> traveller, traveller -> provider, provider
+ * -> traveller). Marketplace, Payments and Safety/Moderation remain
+ * intentionally absent until their approved phases.
  *
  * Import order below follows the dependency direction rather than
  * alphabetical: configuration and observability first because everything
@@ -92,15 +94,16 @@ export class ReadinessRegistryModule {}
     SwipesModule,
     ExplorerModule,
     EventsModule,
+    ChatModule,
+    TrustModule,
 
     // Phase 3 explicitly replaces the infrastructure shell's fail-closed
     // authenticator with Firebase verification plus internal-user resolution.
-    RealtimeModule.forRoot({
-      authenticatorProvider: {
-        provide: SOCKET_AUTHENTICATOR,
-        useExisting: FirebaseSocketAuthenticator,
-      },
-    }),
+    // This is the single shared instantiation (see realtime-wiring.ts) —
+    // ChatModule imports the same object reference rather than calling
+    // RealtimeModule.forRoot() again, which would instantiate a second
+    // gateway/tracker/authenticator.
+    realtimeModule,
 
     ReadinessRegistryModule,
     HealthModule,

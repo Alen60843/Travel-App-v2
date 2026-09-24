@@ -1,4 +1,4 @@
-import { ModerationState, ReviewTargetType, TrustEventType } from '@tripwith/shared';
+import { ModerationState, ReviewerType, ReviewTargetType, TrustEventType } from '@tripwith/shared';
 import {
   Column,
   CreateDateColumn,
@@ -23,8 +23,28 @@ export class ReviewEntity {
   @PrimaryColumn({ type: 'uuid', name: 'id', generated: 'uuid' })
   readonly id!: string;
 
+  // Everything below down to signals is author-submitted content and is
+  // immutable after INSERT (tw_forbid_review_content_mutation, H2 / Product
+  // Decision C) — marked readonly here to mirror that DB invariant at the
+  // type level. isVerified, moderationState, and the inherited soft-delete/
+  // updated-at columns are system-managed lifecycle metadata and may still
+  // be written by a future evidence-processing or moderation action.
+
   @Column({ type: 'uuid', name: 'reviewer_user_id' })
-  reviewerUserId!: string;
+  readonly reviewerUserId!: string;
+
+  /** The capacity the authenticated reviewer acted in. See providers.entity.ts ownerUserId for authorization. */
+  @Column({
+    type: 'enum',
+    enum: ReviewerType,
+    enumName: 'review_reviewer_type',
+    name: 'reviewer_type',
+  })
+  readonly reviewerType!: ReviewerType;
+
+  /** Set only when reviewerType is PROVIDER — the provider whose authority the review carries. */
+  @Column({ type: 'uuid', name: 'reviewer_provider_id', nullable: true })
+  readonly reviewerProviderId!: string | null;
 
   @Column({
     type: 'enum',
@@ -32,31 +52,57 @@ export class ReviewEntity {
     enumName: 'review_target_type',
     name: 'target_type',
   })
-  targetType!: ReviewTargetType;
+  readonly targetType!: ReviewTargetType;
 
   @Column({ type: 'uuid', name: 'target_user_id', nullable: true })
-  targetUserId!: string | null;
+  readonly targetUserId!: string | null;
 
   @Column({ type: 'uuid', name: 'target_provider_id', nullable: true })
-  targetProviderId!: string | null;
+  readonly targetProviderId!: string | null;
 
   @Column({ type: 'uuid', name: 'event_id', nullable: true })
-  eventId!: string | null;
+  readonly eventId!: string | null;
 
   @Column({ type: 'smallint', name: 'rating' })
-  rating!: number;
+  readonly rating!: number;
 
   @Column({ type: 'text', name: 'body', nullable: true })
-  body!: string | null;
+  readonly body!: string | null;
 
   /**
-   * TRUE only when the reviewer was a confirmed participant of event_id.
-   * Unverified reviews never produce a trust delta (§15 anti-abuse) — that
-   * rule lives in the service layer, this column only records the fact.
+   * Direction-specific advisory signals (e.g. wouldTravelAgain,
+   * wouldRecommendProvider). Never authoritative on its own — shape is
+   * validated by the DTO for the specific review direction, not the
+   * database. See the migration comment for why this is JSONB rather than
+   * a column per question.
+   */
+  @Column({ type: 'jsonb', name: 'signals' })
+  readonly signals!: Record<string, boolean>;
+
+  /**
+   * TRUE only when the reviewer's evidence cleared review-verification
+   * eligibility (see trust/attendance-evidence.ts) — a system-owned fact
+   * about the interaction, not part of the author's submission. Independent
+   * of moderationState below: a verified review can still be rejected by
+   * moderation, and moderation approval never implies verification.
+   * Deliberately NOT readonly — unlike the author-content fields above, the
+   * database allows this to change if stronger or disputing evidence
+   * arrives later (tw_forbid_review_content_mutation does not guard it). No
+   * code path writes it after INSERT today.
    */
   @Column({ type: 'boolean', name: 'is_verified' })
   isVerified!: boolean;
 
+  /**
+   * Content-acceptability, not authenticity — orthogonal to isVerified
+   * above. Starts PENDING for every new review (moderation-policy.ts);
+   * only a future moderation action may transition it toward APPROVED/
+   * REJECTED/AUTO_FLAGGED (tw_forbid_review_content_mutation permits writes
+   * to this column specifically). This is a moderation-visibility concern
+   * only — it is not Double-Blind (which is about when counterparties may
+   * see each other's review) and does not implement that separately-scoped
+   * feature.
+   */
   @Column({
     type: 'enum',
     enum: ModerationState,
@@ -75,7 +121,53 @@ export class ReviewEntity {
   deletedAt!: Date | null;
 }
 
-/** The trust ledger. Append-only; see the class-level comment above. */
+/**
+ * Traveller -> Traveller positive-interaction-confirmation + "would travel
+ * again" (WS8.3, Option T2). Deliberately NOT a `ReviewEntity` row: no
+ * rating, no body, no moderation_state, no is_verified — every column here
+ * is author-submitted and the whole row is immutable from INSERT
+ * (tw_forbid_mutation, the same generic append-only guard trust_score_events
+ * uses), so there is no system-managed lifecycle metadata to separate out.
+ *
+ * Row existence IS the positive-interaction confirmation — there is
+ * deliberately no `interacted` column. Omission of a row for a given
+ * (reviewer, target, event) carries no meaning beyond "no positive
+ * confirmation was submitted"; it must never be read as absence, a
+ * no-show, or negative evidence (WS8.2/WS8.3 product decision).
+ */
+@Entity('traveller_feedback')
+export class TravellerFeedbackEntity {
+  @PrimaryColumn({ type: 'uuid', name: 'id', generated: 'uuid' })
+  readonly id!: string;
+
+  @Column({ type: 'uuid', name: 'reviewer_user_id' })
+  readonly reviewerUserId!: string;
+
+  @Column({ type: 'uuid', name: 'target_user_id' })
+  readonly targetUserId!: string;
+
+  @Column({ type: 'uuid', name: 'event_id' })
+  readonly eventId!: string;
+
+  @Column({ type: 'boolean', name: 'would_travel_again' })
+  readonly wouldTravelAgain!: boolean;
+
+  @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
+  readonly createdAt!: Date;
+}
+
+/**
+ * The trust ledger. Append-only; see the class-level comment above.
+ *
+ * No Phase 8 review currently writes a row here (Product Decision B):
+ * subjective review ratings are stored as evidence only, not projected into
+ * Trust Score, until a real reputation/trust policy is designed and
+ * approved. When that policy exists, it will need to stamp each row it
+ * produces with which policy version generated it (a dedicated column, not
+ * an encoding inside `reason`) so historical rows stay explainable after
+ * the policy changes — add that column at that time, scoped to whatever
+ * that policy's writers actually are, rather than pre-emptively now.
+ */
 @Entity('trust_score_events')
 export class TrustScoreEventEntity {
   @PrimaryColumn({ type: 'uuid', name: 'id', generated: 'uuid' })

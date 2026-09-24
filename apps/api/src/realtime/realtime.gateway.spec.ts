@@ -1,12 +1,89 @@
 import type { INestApplication, Provider } from '@nestjs/common';
+import { Global, Module } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import type { Redis } from 'ioredis';
 
+import { APP_CONFIG, type AppConfig } from '../config/configuration';
+import { CACHE_REDIS, QUEUE_REDIS } from '../redis/redis.tokens';
+
+/**
+ * RedisModule (pulled in transitively by RealtimeModule.forRoot() for
+ * PresenceService's CACHE_REDIS dependency) also contains RedisReadinessCheck,
+ * which injects APP_CONFIG directly — for a value it only reads inside
+ * .check(), never called on this test's path. overrideProvider() can only
+ * replace a token that is already registered somewhere in the compiled
+ * graph, and nothing here imports the real (env-var-parsing) ConfigModule,
+ * so APP_CONFIG needs an actual (fake, @Global()) provider, mirroring how
+ * ConfigModule is @Global() in production and therefore ambiently visible
+ * to every nested module once loaded once.
+ */
+@Global()
+@Module({ providers: [{ provide: APP_CONFIG, useValue: {} as AppConfig }], exports: [APP_CONFIG] })
+class FakeConfigModule {}
 import { ConnectionTracker } from './connection-tracker.service';
 import { RealtimeGateway } from './realtime.gateway';
 import { RealtimeModule } from './realtime.module';
 import { userRoom } from './rooms';
 import { SOCKET_AUTHENTICATOR } from './socket-authenticator';
 import type { AuthenticatedPrincipal, SocketAuthenticator } from './socket-authenticator';
+
+/**
+ * A minimal in-memory fake for the CACHE_REDIS connection PresenceService
+ * now depends on (RealtimeModule.forRoot() imports RedisModule for it).
+ * These are e2e-style gateway wire-protocol tests, not presence-correctness
+ * tests (see presence.service.spec.ts for that) — this fake exists only so
+ * the connect/disconnect-driven presence calls the gateway now makes have
+ * something to call instead of failing DI resolution or reaching a real
+ * Redis. No external infrastructure required.
+ */
+function createFakeCacheRedis(): Redis {
+  const hashes = new Map<string, Map<string, string>>();
+  const sortedSets = new Map<string, Map<string, number>>();
+  const strings = new Map<string, string>();
+  return {
+    async hset(key: string, fields: Record<string, string>): Promise<number> {
+      const hash = hashes.get(key) ?? new Map<string, string>();
+      for (const [field, value] of Object.entries(fields)) hash.set(field, value);
+      hashes.set(key, hash);
+      return 1;
+    },
+    async hget(key: string, field: string): Promise<string | null> {
+      return hashes.get(key)?.get(field) ?? null;
+    },
+    async expire(): Promise<number> {
+      return 1;
+    },
+    async zadd(key: string, score: number, member: string): Promise<number> {
+      const set = sortedSets.get(key) ?? new Map<string, number>();
+      set.set(member, score);
+      sortedSets.set(key, set);
+      return 1;
+    },
+    async zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]> {
+      const set = sortedSets.get(key) ?? new Map<string, number>();
+      const lo = min === '-inf' ? -Infinity : Number(min);
+      const hi = max === '+inf' ? Infinity : Number(max);
+      return [...set.entries()].filter(([, score]) => score >= lo && score <= hi).map(([member]) => member);
+    },
+    async zrem(key: string, member: string): Promise<number> {
+      return sortedSets.get(key)?.delete(member) ? 1 : 0;
+    },
+    async get(key: string): Promise<string | null> {
+      return strings.get(key) ?? null;
+    },
+    async set(key: string, value: string): Promise<'OK'> {
+      strings.set(key, value);
+      return 'OK';
+    },
+    async del(key: string): Promise<number> {
+      return hashes.delete(key) || strings.delete(key) ? 1 : 0;
+    },
+    // RedisLifecycleService.onModuleDestroy() checks `.status` before doing
+    // anything else and returns immediately when it's already 'end' — this
+    // fake never needs a real graceful-quit sequence.
+    status: 'end',
+  } as unknown as Redis;
+}
 
 /**
  * These tests drive a real, in-process Nest application over an actual
@@ -78,8 +155,19 @@ describe('RealtimeGateway (real Nest app, real WebSocket wire protocol)', () => 
 
   async function buildApp(authenticatorProvider?: Provider): Promise<void> {
     const moduleRef = await Test.createTestingModule({
-      imports: [RealtimeModule.forRoot(authenticatorProvider ? { authenticatorProvider } : {})],
-    }).compile();
+      imports: [
+        FakeConfigModule,
+        RealtimeModule.forRoot(authenticatorProvider ? { authenticatorProvider } : {}),
+      ],
+    })
+      .overrideProvider(CACHE_REDIS)
+      .useValue(createFakeCacheRedis())
+      // RedisModule (imported transitively for CACHE_REDIS) also provides
+      // QUEUE_REDIS as part of the same unit; nothing on this gateway's
+      // path uses it, but Nest still constructs it, so it needs a stand-in.
+      .overrideProvider(QUEUE_REDIS)
+      .useValue({ status: 'end' })
+      .compile();
 
     const nestApp = moduleRef.createNestApplication();
     await nestApp.listen(0);
@@ -184,6 +272,51 @@ describe('RealtimeGateway (real Nest app, real WebSocket wire protocol)', () => 
       app = undefined; // already closed; afterEach must not close it again
 
       await expect(clientClosed).resolves.toBeDefined();
+    });
+  });
+
+  describe('WS4 presence: connect/activity over the real wire protocol', () => {
+    beforeEach(async () => {
+      await buildApp({ provide: SOCKET_AUTHENTICATOR, useClass: FakeAuthenticator });
+    });
+
+    it('emits presence:update on connect (OFFLINE -> ONLINE) with a payload containing only userId and state', async () => {
+      const ws = await openEngineIoSocket(port);
+      const presenceUpdate = waitForFrame(ws, (f) => f.startsWith('42["presence:update"'));
+      ws.send('40{"token":"good-token"}');
+
+      const frame = await presenceUpdate;
+      const [, payload] = JSON.parse(frame.slice(2)) as [string, Record<string, unknown>];
+      expect(payload).toEqual({ userId: 'user-123', state: 'ONLINE' });
+      expect(Object.keys(payload).sort()).toEqual(['state', 'userId']);
+
+      const clientClosed = waitForClose(ws);
+      ws.close();
+      await clientClosed;
+    });
+
+    it('does not emit a duplicate presence:update for a presence:activity ping while already ONLINE', async () => {
+      const ws = await openEngineIoSocket(port);
+      ws.send('40{"token":"good-token"}');
+      await waitForFrame(ws, (f) => f.startsWith('42["presence:update"'));
+
+      let sawAnotherPresenceUpdate = false;
+      const handler = (ev: MessageEvent): void => {
+        if (String(ev.data).startsWith('42["presence:update"')) sawAnotherPresenceUpdate = true;
+      };
+      ws.addEventListener('message', handler);
+
+      ws.send('42["presence:activity"]');
+      // No further frame is expected; give the server a bounded window to
+      // (incorrectly) emit one before asserting it didn't.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      ws.removeEventListener('message', handler);
+
+      expect(sawAnotherPresenceUpdate).toBe(false);
+
+      const clientClosed = waitForClose(ws);
+      ws.close();
+      await clientClosed;
     });
   });
 });

@@ -88,7 +88,12 @@ export class EventsRepository {
   async setTransitionContext(
     manager: EntityManager,
     actorUserId: string,
-    reason: 'host_publish' | 'host_cancel' | 'capacity_reached',
+    // 'seat_freed' (WS8.4B): a FULL -> ACTIVE bounce-back when a leave/remove
+    // frees a seat. Describes only why the EVENT status changed — whether
+    // the freed seat came from a voluntary leave or a host removal is a
+    // separate fact recorded on the EventParticipant row itself
+    // (event_participants.cancellation_reason), not overloaded onto this.
+    reason: 'host_publish' | 'host_cancel' | 'capacity_reached' | 'seat_freed',
   ): Promise<void> {
     await manager.query(
       `SELECT set_config('tripwith.actor_user_id', $1, true),

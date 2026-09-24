@@ -44,6 +44,13 @@ export class UpdateEventDto {
   @Max(10_000)
   capacityMax?: number;
 
+  /** WS8.5B: DRAFT-only editable (updateEvent itself requires DRAFT); frozen at publish. */
+  @ValidateIf((_object, value: unknown) => value !== undefined)
+  @IsInt()
+  @Min(0)
+  @Max(9999)
+  hostGuestCount?: number;
+
   @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsInt()
   @Min(0)

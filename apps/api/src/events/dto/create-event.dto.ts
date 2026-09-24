@@ -42,6 +42,13 @@ export class CreateEventDto {
   @Max(10_000)
   capacityMax!: number;
 
+  /** WS8.5B: the USER host's own party size (1 + hostGuestCount seats). DRAFT-only editable; frozen at publish. */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(9999)
+  hostGuestCount?: number;
+
   @IsOptional()
   @IsInt()
   @Min(0)

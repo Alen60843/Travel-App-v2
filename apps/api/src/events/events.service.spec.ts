@@ -65,6 +65,8 @@ function eventFixture(overrides: Partial<EventEntity> = {}): EventEntity {
     visibility: EventVisibility.Public,
     capacityMax: 20,
     participantCount: 0,
+    hostGuestCount: 0,
+    reservedSeatCount: 1,
     priceMinor: 0,
     depositMinor: 0,
     currency: 'EUR',
@@ -129,6 +131,52 @@ describe('EventsService', () => {
     });
     expect(result).not.toHaveProperty('hostUserId');
     expect(result).not.toHaveProperty('timeRange');
+  });
+
+  // WS8.5B
+  it('defaults hostGuestCount to 0 and consumes exactly one physical seat', async () => {
+    const result = await service.createEvent(USER_ID, createDto());
+    expect(repository.createEvent).toHaveBeenCalledWith(
+      manager,
+      expect.objectContaining({ hostGuestCount: 0 }),
+    );
+    expect(result.hostGuestCount).toBe(0);
+  });
+
+  // WS8.5B
+  it('accepts an explicit hostGuestCount — host + 2 guests occupies three seats', async () => {
+    const result = await service.createEvent(USER_ID, createDto({ hostGuestCount: 2, capacityMax: 10 }));
+    expect(repository.createEvent).toHaveBeenCalledWith(
+      manager,
+      expect.objectContaining({ hostGuestCount: 2 }),
+    );
+    expect(result.hostGuestCount).toBe(2);
+  });
+
+  // WS8.5B
+  it('rejects a negative, non-integer, or out-of-bound hostGuestCount', async () => {
+    await expect(
+      service.createEvent(USER_ID, createDto({ hostGuestCount: -1 })),
+    ).rejects.toBeInstanceOf(InvalidEventValueError);
+    await expect(
+      service.createEvent(USER_ID, createDto({ hostGuestCount: 1.5 })),
+    ).rejects.toBeInstanceOf(InvalidEventValueError);
+    await expect(
+      service.createEvent(USER_ID, createDto({ hostGuestCount: 10_000 })),
+    ).rejects.toBeInstanceOf(InvalidEventValueError);
+  });
+
+  // WS8.5B
+  it('rejects a host party (1 + hostGuestCount) larger than capacityMax', async () => {
+    await expect(
+      service.createEvent(USER_ID, createDto({ capacityMax: 3, hostGuestCount: 3 })),
+    ).rejects.toBeInstanceOf(InvalidEventValueError);
+  });
+
+  // WS8.5B
+  it('accepts a host party that exactly fills capacityMax', async () => {
+    const result = await service.createEvent(USER_ID, createDto({ capacityMax: 3, hostGuestCount: 2 }));
+    expect(result.hostGuestCount).toBe(2);
   });
 
   it('rejects client-selected host/projection fields even if service is called directly', async () => {
@@ -212,6 +260,29 @@ describe('EventsService', () => {
     ).rejects.toBeInstanceOf(EventDraftRequiredError);
   });
 
+  // WS8.5B
+  it('lets hostGuestCount be edited while DRAFT', async () => {
+    repository.findOwnedEvent.mockResolvedValue(eventFixture());
+    const updated = await service.updateEvent(USER_ID, EVENT_ID, { hostGuestCount: 3 });
+    expect(updated.hostGuestCount).toBe(3);
+  });
+
+  // WS8.5B
+  it('rejects editing hostGuestCount once the Event is no longer DRAFT (frozen at publish)', async () => {
+    repository.findOwnedEvent.mockResolvedValue(eventFixture({ status: EventStatus.Active }));
+    await expect(
+      service.updateEvent(USER_ID, EVENT_ID, { hostGuestCount: 3 }),
+    ).rejects.toBeInstanceOf(EventDraftRequiredError);
+  });
+
+  // WS8.5B
+  it('rejects an edited hostGuestCount that would no longer fit the (possibly also-edited) capacityMax', async () => {
+    repository.findOwnedEvent.mockResolvedValue(eventFixture({ hostGuestCount: 1 }));
+    await expect(
+      service.updateEvent(USER_ID, EVENT_ID, { capacityMax: 1 }),
+    ).rejects.toBeInstanceOf(InvalidEventValueError);
+  });
+
   it('publishes exactly DRAFT to ACTIVE after locking and setting trigger context', async () => {
     const draft = eventFixture();
     repository.findOwnedEvent.mockResolvedValue(draft);
@@ -229,6 +300,26 @@ describe('EventsService', () => {
     expect(repository.setTransitionContext.mock.invocationCallOrder[0]).toBeLessThan(
       repository.saveEvent.mock.invocationCallOrder[0]!,
     );
+  });
+
+  // WS8.5B: DRAFT -> FULL when the host party alone fills capacityMax.
+  it('publishes straight to FULL when the host party (1 + hostGuestCount) alone fills capacityMax', async () => {
+    const draft = eventFixture({ capacityMax: 3, hostGuestCount: 2, participantCount: 0 });
+    repository.findOwnedEvent.mockResolvedValue(draft);
+
+    const published = await service.publishEvent(USER_ID, EVENT_ID, NOW);
+
+    expect(published.status).toBe(EventStatus.Full);
+  });
+
+  // WS8.5B: the ordinary case — host party alone does not fill capacity.
+  it('publishes to ACTIVE, not FULL, when the host party does not alone fill capacityMax', async () => {
+    const draft = eventFixture({ capacityMax: 3, hostGuestCount: 0, participantCount: 0 });
+    repository.findOwnedEvent.mockResolvedValue(draft);
+
+    const published = await service.publishEvent(USER_ID, EVENT_ID, NOW);
+
+    expect(published.status).toBe(EventStatus.Active);
   });
 
   it('rejects inactive, already-started, repeated, and illegal publish attempts', async () => {

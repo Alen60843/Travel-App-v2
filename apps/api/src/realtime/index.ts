@@ -4,6 +4,9 @@
  * report (Agent D, Phase 2) for exactly what needs to change in those files.
  */
 export { ConnectionTracker } from './connection-tracker.service';
+export { PresenceService } from './presence.service';
+export { PresenceState } from './presence.types';
+export type { PresenceTransition, PresenceUpdate } from './presence.types';
 export { RealtimeGateway } from './realtime.gateway';
 export type { RealtimeSocket, RealtimeSocketData } from './realtime-socket.types';
 export { RealtimeModule } from './realtime.module';

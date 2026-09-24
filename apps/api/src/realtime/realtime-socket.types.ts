@@ -3,6 +3,8 @@ import type { Socket } from 'socket.io';
 /** Per-socket state the gateway attaches once a connection is authenticated. */
 export interface RealtimeSocketData {
   userId?: string;
+  /** This connection's presence session id — see presence.service.ts. */
+  sessionId?: string;
 }
 
 /**

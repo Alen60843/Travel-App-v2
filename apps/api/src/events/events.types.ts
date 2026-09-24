@@ -29,6 +29,12 @@ export interface EventView {
   readonly visibility: EventVisibility;
   readonly capacityMax: number;
   readonly participantCount: number;
+  /** WS8.5B: the USER host's own party size (irrelevant/0 for provider-hosted events). */
+  readonly hostGuestCount: number;
+  /** WS8.5B: total physical seats currently occupied (host + host's guests + participants + their guests). Server/DB-owned — never derived client-side. */
+  readonly reservedSeatCount: number;
+  /** WS8.5B: capacityMax - reservedSeatCount, never negative. */
+  readonly remainingSeats: number;
   readonly priceMinor: number;
   readonly depositMinor: number;
   readonly currency: string;

@@ -44,11 +44,16 @@ export type EventStatus = (typeof EventStatus)[keyof typeof EventStatus];
  * Mirrors tw_event_status_guard() in the database. The database is the
  * backstop; this table is what the service layer and the UI read so an
  * impossible action is never offered in the first place.
+ *
+ * DRAFT -> FULL (WS8.5B): a USER host whose own party (1 + hostGuestCount)
+ * already equals capacityMax fills the Event before publish can ever offer
+ * a seat to anyone else — publishing must land it in FULL, not ACTIVE.
+ * Additive only; every other transition is exactly as strict as before.
  */
 export const EVENT_STATUS_TRANSITIONS: Readonly<
   Record<EventStatus, readonly EventStatus[]>
 > = {
-  DRAFT: ['ACTIVE', 'CANCELLED'],
+  DRAFT: ['ACTIVE', 'FULL', 'CANCELLED'],
   ACTIVE: ['FULL', 'IN_PROGRESS', 'CANCELLED'],
   FULL: ['ACTIVE', 'IN_PROGRESS', 'CANCELLED'],
   IN_PROGRESS: ['COMPLETED', 'CANCELLED'],
@@ -92,6 +97,23 @@ export const AttendanceStatus = {
 } as const;
 export type AttendanceStatus =
   (typeof AttendanceStatus)[keyof typeof AttendanceStatus];
+
+/**
+ * WS8.4B: why an EventParticipant's active membership ended. Exactly the two
+ * V1 cases — no speculative reasons. Distinct from the EventJoinRequest that
+ * originally granted membership: the JoinRequest stays a truthful historical
+ * decision record (still APPROVED) even after the participation it produced
+ * is later cancelled — this enum lives on event_participants, never rewrites
+ * event_join_requests.status.
+ */
+export const EventParticipantCancellationReason = {
+  /** cancelled_by_user_id = the participant themselves. */
+  VoluntaryLeave: 'VOLUNTARY_LEAVE',
+  /** cancelled_by_user_id = the event's USER host. */
+  HostRemoval: 'HOST_REMOVAL',
+} as const;
+export type EventParticipantCancellationReason =
+  (typeof EventParticipantCancellationReason)[keyof typeof EventParticipantCancellationReason];
 
 export const SwipeDirection = { Like: 'LIKE', Pass: 'PASS' } as const;
 export type SwipeDirection = (typeof SwipeDirection)[keyof typeof SwipeDirection];
@@ -144,6 +166,15 @@ export type TrustEventType = (typeof TrustEventType)[keyof typeof TrustEventType
 export const ReviewTargetType = { User: 'USER', Provider: 'PROVIDER' } as const;
 export type ReviewTargetType =
   (typeof ReviewTargetType)[keyof typeof ReviewTargetType];
+
+/**
+ * The capacity the authenticated reviewer acted in. Distinct from
+ * ReviewTargetType: a PROVIDER reviewer's target_type is always USER
+ * (providers review travellers, never other providers), so this cannot be
+ * derived from target_type — it is the reviewer-side counterpart.
+ */
+export const ReviewerType = { Traveller: 'TRAVELLER', Provider: 'PROVIDER' } as const;
+export type ReviewerType = (typeof ReviewerType)[keyof typeof ReviewerType];
 
 export const ModerationState = {
   Pending: 'PENDING',

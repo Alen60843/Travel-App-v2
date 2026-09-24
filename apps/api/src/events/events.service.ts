@@ -42,6 +42,7 @@ const CREATE_FIELDS = new Set([
   'description',
   'visibility',
   'capacityMax',
+  'hostGuestCount',
   'priceMinor',
   'depositMinor',
   'currency',
@@ -74,6 +75,9 @@ export class EventsService {
     const visibility = dto.visibility ?? EventVisibility.Public;
     assertEventVisibility(visibility);
     assertEventInteger(dto.capacityMax, 'capacityMax', 1, 10_000);
+    const hostGuestCount = dto.hostGuestCount ?? 0;
+    assertEventInteger(hostGuestCount, 'hostGuestCount', 0, 9999);
+    this.assertHostPartyFits(hostGuestCount, dto.capacityMax);
     const priceMinor = dto.priceMinor ?? 0;
     const depositMinor = dto.depositMinor ?? 0;
     assertEventMoney(priceMinor, depositMinor);
@@ -108,6 +112,7 @@ export class EventsService {
         status: EventStatus.Draft,
         visibility,
         capacityMax: dto.capacityMax,
+        hostGuestCount,
         priceMinor,
         depositMinor,
         currency,
@@ -170,6 +175,9 @@ export class EventsService {
           'capacityMax cannot be lower than participantCount.',
         );
       }
+      const hostGuestCount = dto.hostGuestCount ?? event.hostGuestCount;
+      assertEventInteger(hostGuestCount, 'hostGuestCount', 0, 9999);
+      this.assertHostPartyFits(hostGuestCount, capacityMax);
       const priceMinor = dto.priceMinor ?? event.priceMinor;
       const depositMinor = dto.depositMinor ?? event.depositMinor;
       assertEventMoney(priceMinor, depositMinor);
@@ -203,6 +211,7 @@ export class EventsService {
         description,
         visibility,
         capacityMax,
+        hostGuestCount,
         priceMinor,
         depositMinor,
         currency,
@@ -240,7 +249,15 @@ export class EventsService {
       }
 
       await this.repository.setTransitionContext(manager, userId, 'host_publish');
-      event.status = EventStatus.Active;
+      // WS8.5B: at publish time reservedSeatCount is always exactly
+      // 1 + hostGuestCount — no participant can exist yet (joining requires
+      // status = ACTIVE, per assertJoinable), so this is a deterministic
+      // check, not a race-prone read. A host party that alone fills
+      // capacityMax must publish straight to FULL rather than incorrectly
+      // advertising the Event as joinable (DRAFT -> FULL is now an allowed
+      // transition — see EVENT_STATUS_TRANSITIONS).
+      const hostPartyFillsCapacity = 1 + event.hostGuestCount === event.capacityMax;
+      event.status = hostPartyFillsCapacity ? EventStatus.Full : EventStatus.Active;
       event.category = category;
       return this.toEventView(await this.repository.saveEvent(manager, event), category);
     });
@@ -297,6 +314,8 @@ export class EventsService {
     if (event.participantCount > event.capacityMax) {
       throw new InvalidEventValueError('capacityMax', 'Event capacity has already been exceeded.');
     }
+    assertEventInteger(event.hostGuestCount, 'hostGuestCount', 0, 9999);
+    this.assertHostPartyFits(event.hostGuestCount, event.capacityMax);
     assertEventMoney(event.priceMinor, event.depositMinor);
     normaliseEventCurrency(event.currency);
     assertOrderedEventTimes(event.startsAt, event.endsAt);
@@ -323,6 +342,16 @@ export class EventsService {
       throw new InvalidEventValueError(
         'meetingPoint',
         'latitude must be within [-90,90] and longitude within [-180,180].',
+      );
+    }
+  }
+
+  /** WS8.5B: the USER host's own party (1 + hostGuestCount) may never exceed capacityMax, checked independently of any participant — this is a pure creation/edit-time guard; the DB's events_host_party_capacity_chk is the backstop. */
+  private assertHostPartyFits(hostGuestCount: number, capacityMax: number): void {
+    if (1 + hostGuestCount > capacityMax) {
+      throw new InvalidEventValueError(
+        'hostGuestCount',
+        'The host party (1 + hostGuestCount) cannot exceed capacityMax.',
       );
     }
   }
@@ -356,6 +385,9 @@ export class EventsService {
       visibility: event.visibility,
       capacityMax: event.capacityMax,
       participantCount: event.participantCount,
+      hostGuestCount: event.hostGuestCount,
+      reservedSeatCount: event.reservedSeatCount,
+      remainingSeats: Math.max(0, event.capacityMax - event.reservedSeatCount),
       priceMinor: event.priceMinor,
       depositMinor: event.depositMinor,
       currency: event.currency,

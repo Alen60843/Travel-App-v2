@@ -29,7 +29,7 @@ import {
 } from './events.entity';
 import { PaymentEntity, PaymentEventEntity } from './payments.entity';
 import { ChatMemberEntity, ChatRoomEntity, MatchEntity, MessageEntity, SwipeEntity } from './social.entity';
-import { ReviewEntity, TrustScoreEventEntity } from './trust.entity';
+import { ReviewEntity, TravellerFeedbackEntity, TrustScoreEventEntity } from './trust.entity';
 import {
   AccountRestrictionEntity,
   ReportEntity,
@@ -41,7 +41,7 @@ import {
 import { JobOutboxEntity } from './platform.entity';
 
 /**
- * All 35 application-table entities, in one array for `entities:` on both
+ * All 36 application-table entities, in one array for `entities:` on both
  * the DataSource (data-source.ts) and the Nest TypeOrmModule
  * (database.module.ts) — the two must never drift apart, so both import
  * this instead of listing entities themselves.
@@ -82,6 +82,7 @@ export const entities = [
   MessageEntity,
   // trust
   ReviewEntity,
+  TravellerFeedbackEntity,
   TrustScoreEventEntity,
   // safety
   AccountRestrictionEntity,

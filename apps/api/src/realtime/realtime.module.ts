@@ -1,7 +1,9 @@
 import type { DynamicModule, Provider } from '@nestjs/common';
 import { Module } from '@nestjs/common';
 
+import { RedisModule } from '../redis/redis.module';
 import { ConnectionTracker } from './connection-tracker.service';
+import { PresenceService } from './presence.service';
 import { RealtimeGateway } from './realtime.gateway';
 import { RejectingSocketAuthenticator, SOCKET_AUTHENTICATOR } from './socket-authenticator';
 
@@ -45,8 +47,32 @@ export class RealtimeModule {
 
     return {
       module: RealtimeModule,
-      providers: [authenticatorProvider, ConnectionTracker, RealtimeGateway],
-      exports: [SOCKET_AUTHENTICATOR, ConnectionTracker],
+      // RedisModule (static, not @Global()) is imported here explicitly:
+      // sibling imports in AppModule do not share providers with each other,
+      // so PresenceService's CACHE_REDIS dependency needs this module to
+      // pull it in directly. RedisModule is a plain static module, so Nest
+      // deduplicates this against AppModule's own RedisModule import by
+      // class reference — no second Redis connection is created, same as
+      // ChatModule/AuthModule/DatabaseModule already being imported from
+      // multiple places in this app.
+      imports: [RedisModule],
+      // PresenceService sits alongside ConnectionTracker/RealtimeGateway
+      // rather than in its own module: it needs CACHE_REDIS (imported by
+      // whatever composes this module, same as elsewhere in the app — see
+      // app.module.ts), and its connect/disconnect/heartbeat lifecycle is
+      // driven directly by RealtimeGateway, exactly like ConnectionTracker's
+      // already is. A separate presence module would need RealtimeGateway
+      // injected back into it for delivery, which — since RealtimeGateway
+      // would in turn need that module's PresenceService — is a circular
+      // dependency for no benefit; RealtimeGateway already owns `server`
+      // and can emit presence:update directly.
+      providers: [authenticatorProvider, ConnectionTracker, PresenceService, RealtimeGateway],
+      // RealtimeGateway is exported so a single shared instance of this
+      // dynamic module (see ../realtime-wiring.ts) can be imported by more
+      // than one feature module without instantiating a second gateway.
+      // PresenceService is exported for the same forward-compatibility
+      // reason, even though nothing outside realtime/ consumes it yet.
+      exports: [SOCKET_AUTHENTICATOR, ConnectionTracker, PresenceService, RealtimeGateway],
     };
   }
 }

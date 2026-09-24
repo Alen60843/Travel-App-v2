@@ -50,7 +50,7 @@ describe('EventsController', () => {
     expect(service.cancelEvent).toHaveBeenCalledWith(USER_ID, EVENT_ID);
   });
 
-  it.each(['hostUserId', 'hostProviderId', 'hostType', 'status', 'participantCount', 'timeRange'])(
+  it.each(['hostUserId', 'hostProviderId', 'hostType', 'status', 'participantCount', 'reservedSeatCount', 'timeRange'])(
     'rejects protected create field %s through the global whitelist contract',
     async (field) => {
       const pipe = createValidationPipe();
