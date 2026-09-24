@@ -245,44 +245,210 @@ $$, tw_id('alice'), tw_id('alice')), 'block: self-block rejected', '23514');
 
 
 -- ---------------------------------------------------------------------------
--- 5. Event capacity + duplicate participation
+-- 5. Event capacity + duplicate participation (Phase 8 physical-seat model)
+--
+-- WS8.5E-A: capacity_max now bounds TOTAL PHYSICAL OCCUPANCY
+-- (reserved_seat_count), not the count of registered EventParticipant rows
+-- (participant_count, which keeps its old, separate, narrower meaning). For
+-- this fixture's USER-hosted event, capacity_max = 2 and the host alone
+-- already occupies 1 physical seat (host_guest_count = 0 by default) — so
+-- only ONE participant fits, not two. This replaces the pre-Phase-8
+-- expectation (host excluded from capacity) that this section used to test.
 -- ---------------------------------------------------------------------------
 DO $cap$
 DECLARE
   ev UUID := tw_id('event');
-  cnt INT;
+  pcnt INT; rcnt INT;
 BEGIN
+  -- Host alone already reserves 1 of the 2 physical seats.
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = ev;
+  PERFORM tw_assert(pcnt = 0 AND rcnt = 1,
+    'event: USER host alone reserves 1 physical seat before any participant joins',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
+
+  -- Alice fills the one remaining physical seat exactly.
   INSERT INTO event_participants (event_id, user_id) VALUES (ev, tw_id('alice'));
-  INSERT INTO event_participants (event_id, user_id) VALUES (ev, tw_id('bob'));
-  SELECT participant_count INTO cnt FROM events WHERE id = ev;
-  PERFORM tw_assert(cnt = 2, 'event: participant_count maintained by trigger',
-    format('count=%s', cnt));
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = ev;
+  PERFORM tw_assert(pcnt = 1 AND rcnt = 2,
+    'event: participant_count and reserved_seat_count diverge by exactly the host''s 1 seat',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
 END $cap$;
 
 SELECT tw_expect_error(format($$
   INSERT INTO event_participants (event_id, user_id) VALUES (%L, %L)
 $$, tw_id('event'), tw_id('alice')), 'event: duplicate participation rejected', '23505');
 
--- capacity_max = 2 and two seats are taken.
+-- capacity_max = 2, and host (1) + Alice (1) already reserve both physical
+-- seats — a second DISTINCT participant is over physical capacity even
+-- though participant_count (1) is still below capacity_max (2). This is the
+-- concrete proof that reserved_seat_count, not participant_count, is the
+-- authoritative physical-capacity constraint.
 SELECT tw_expect_error(format($$
   INSERT INTO event_participants (event_id, user_id) VALUES (%L, %L)
-$$, tw_id('event'), tw_id('carol')),
-  'event: over-capacity insert rejected by CHECK', '23514');
+$$, tw_id('event'), tw_id('bob')),
+  'event: over-capacity insert rejected by CHECK even though participant_count < capacity_max',
+  '23514');
 
--- Freeing a seat must let the next participant in.
+-- Freeing Alice's seat must let Bob in — and must release exactly 1 seat
+-- (Alice has guest_count = 0), returning reserved_seat_count to the host-only
+-- baseline before Bob's seat is re-reserved.
 DO $free$
-DECLARE cnt INT;
+DECLARE pcnt INT; rcnt INT;
 BEGIN
+  -- WS8.4B: event_participants_cancel_consistency_chk requires
+  -- cancellation_reason and cancelled_by_user_id NOT NULL together with
+  -- cancelled_at. Alice is freeing her own seat — a voluntary leave, actor
+  -- = Alice herself.
   UPDATE event_participants
-     SET cancelled_at = now(), attendance_status = 'CANCELLED'
-   WHERE event_id = tw_id('event') AND user_id = tw_id('bob');
-  SELECT participant_count INTO cnt FROM events WHERE id = tw_id('event');
-  PERFORM tw_assert(cnt = 1, 'event: cancellation decrements count', format('count=%s', cnt));
+     SET cancelled_at = now(), attendance_status = 'CANCELLED',
+         cancellation_reason = 'VOLUNTARY_LEAVE', cancelled_by_user_id = tw_id('alice')
+   WHERE event_id = tw_id('event') AND user_id = tw_id('alice');
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = tw_id('event');
+  PERFORM tw_assert(pcnt = 0 AND rcnt = 1,
+    'event: cancellation releases the participant''s exact seat count, host baseline remains',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
 
   INSERT INTO event_participants (event_id, user_id) VALUES (tw_id('event'), tw_id('carol'));
-  SELECT participant_count INTO cnt FROM events WHERE id = tw_id('event');
-  PERFORM tw_assert(cnt = 2, 'event: freed seat is reusable', format('count=%s', cnt));
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = tw_id('event');
+  PERFORM tw_assert(pcnt = 1 AND rcnt = 2, 'event: freed seat is reusable',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
 END $free$;
+
+
+-- ---------------------------------------------------------------------------
+-- 5b. Guest Seats: host guests + participant guests (WS8.5B/C physical model)
+--
+-- A dedicated fixture (not tw_id('event')) so this section's arithmetic is
+-- self-contained and does not disturb the participant state the rest of
+-- this file's later sections (6+) rely on for the shared 'event' fixture.
+-- Proves the exact worked example from the WS8.5E-A task: USER host with
+-- host_guest_count = 1, one participant (Daniel) with guest_count = 2.
+-- ---------------------------------------------------------------------------
+DO $guests$
+DECLARE
+  u_daniel UUID; ev2 UUID; part UUID;
+  pcnt INT; rcnt INT;
+BEGIN
+  INSERT INTO users (firebase_uid, email, date_of_birth, account_status)
+  VALUES ('fb_daniel', 'daniel@example.com', CURRENT_DATE - INTERVAL '33 years', 'ACTIVE')
+  RETURNING id INTO u_daniel;
+  INSERT INTO user_profiles (user_id, display_name, travel_style) VALUES (u_daniel, 'Daniel', 2);
+  INSERT INTO user_settings (user_id) VALUES (u_daniel);
+
+  -- host_guest_count = 1 set at INSERT time: proves tw_seed_reserved_seat_count
+  -- seeds reserved_seat_count = 1 (host) + 1 (host's guest) = 2 immediately,
+  -- with zero participants yet (participant_count = 0).
+  INSERT INTO events (
+    host_type, host_user_id, category_id, title, capacity_max, host_guest_count,
+    starts_at, ends_at, meeting_point, status
+  ) VALUES (
+    'USER', tw_id('host'), (SELECT id FROM event_categories WHERE code = 'trek'),
+    'Guest Seats Fixture', 6, 1,
+    now() + INTERVAL '11 days', now() + INTERVAL '11 days 6 hours',
+    ST_MakePoint(100.5018, 13.7563)::GEOGRAPHY, 'ACTIVE'
+  ) RETURNING id INTO ev2;
+  INSERT INTO tw_ids VALUES ('daniel', u_daniel), ('event_guests', ev2);
+
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = ev2;
+  PERFORM tw_assert(pcnt = 0 AND rcnt = 2,
+    'guest seats: tw_seed_reserved_seat_count seeds host + host_guest_count with 0 participants',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
+
+  -- Daniel (+2 guests) joins: reserved_seat_count += 1 + guest_count = 3.
+  -- participant_count counts Daniel's ONE registered row, never his guests.
+  INSERT INTO event_participants (event_id, user_id, guest_count)
+  VALUES (ev2, u_daniel, 2) RETURNING id INTO part;
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = ev2;
+  PERFORM tw_assert(pcnt = 1 AND rcnt = 5,
+    'guest seats: participant_count counts Daniel once; reserved_seat_count counts host(1)+hostGuest(1)+Daniel(1)+Daniel guests(2)=5',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
+
+  -- guest_count UPDATE (2 -> 3): trigger applies the OLD-vs-NEW weighted
+  -- delta, (1+3)-(1+2) = 1, without touching participant_count at all.
+  UPDATE event_participants SET guest_count = 3 WHERE id = part;
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = ev2;
+  PERFORM tw_assert(pcnt = 1 AND rcnt = 6,
+    'guest seats: guest_count UPDATE adjusts reserved_seat_count by the OLD-vs-NEW weighted delta',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
+END $guests$;
+
+-- capacity_max = 6 and reserved_seat_count is already exactly 6 — the CHECK
+-- must reject even a zero-guest participant, proving reserved_seat_count
+-- (not participant_count, which is only 1) is the binding physical constraint.
+SELECT tw_expect_error(format($$
+  INSERT INTO event_participants (event_id, user_id) VALUES (%L, %L)
+$$, tw_id('event_guests'), tw_id('carol')),
+  'guest seats: over-capacity insert rejected even though participant_count (1) is far below capacity_max (6)',
+  '23514');
+
+DO $guests_release$
+DECLARE pcnt INT; rcnt INT;
+BEGIN
+  -- Cancelling Daniel must release ALL of his party's seats atomically:
+  -- 1 (Daniel) + 3 (his current guest_count) = 4, returning
+  -- reserved_seat_count to the host-only baseline of 2. Same WS8.4B
+  -- consistency requirement as Alice's cancellation above — Daniel is
+  -- leaving voluntarily, actor = Daniel himself.
+  UPDATE event_participants
+     SET cancelled_at = now(), attendance_status = 'CANCELLED',
+         cancellation_reason = 'VOLUNTARY_LEAVE', cancelled_by_user_id = tw_id('daniel')
+   WHERE event_id = tw_id('event_guests') AND user_id = tw_id('daniel');
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = tw_id('event_guests');
+  PERFORM tw_assert(pcnt = 0 AND rcnt = 2,
+    'guest seats: cancellation releases 1 + guest_count seats atomically (whole party at once)',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
+
+  -- host_guest_count UPDATE (1 -> 0): proves tw_adjust_reserved_seat_count_for_host
+  -- adjusts reserved_seat_count independently of any participant activity.
+  UPDATE events SET host_guest_count = 0 WHERE id = tw_id('event_guests');
+  SELECT participant_count, reserved_seat_count INTO pcnt, rcnt FROM events WHERE id = tw_id('event_guests');
+  PERFORM tw_assert(pcnt = 0 AND rcnt = 1,
+    'guest seats: host_guest_count UPDATE adjusts reserved_seat_count via its own trigger',
+    format('participant_count=%s reserved_seat_count=%s', pcnt, rcnt));
+END $guests_release$;
+
+-- FULL/ACTIVE: the DB guard (not an automatic DB trigger — see
+-- JoinRequestsService.approveAndParticipate for the application-level
+-- transition) allows a USER-hosted Event to publish straight into FULL when
+-- the host's own party alone already fills capacity_max (WS8.5B's
+-- DRAFT>FULL addition to tw_event_status_guard). This DB-level harness can
+-- only prove the transition is legal, not that it happens automatically —
+-- that is application behavior, covered by events.service.spec.ts /
+-- events.int-spec.ts (unexecuted here — see PostgreSQL runtime status).
+DO $host_fills$
+DECLARE ev3 UUID; n INT;
+BEGIN
+  INSERT INTO events (
+    host_type, host_user_id, category_id, title, capacity_max, host_guest_count,
+    starts_at, ends_at, meeting_point, status
+  ) VALUES (
+    'USER', tw_id('host'), (SELECT id FROM event_categories WHERE code = 'trek'),
+    'Host Fills Own Event', 1, 0,
+    now() + INTERVAL '12 days', now() + INTERVAL '12 days 3 hours',
+    ST_MakePoint(100.5018, 13.7563)::GEOGRAPHY, 'DRAFT'
+  ) RETURNING id INTO ev3;
+
+  UPDATE events SET status = 'FULL' WHERE id = ev3;
+  SELECT count(*) INTO n FROM event_status_history
+   WHERE event_id = ev3 AND from_status = 'DRAFT' AND to_status = 'FULL';
+  PERFORM tw_assert(n = 1,
+    'guest seats: DRAFT->FULL is a legal, audited transition (host-alone-fills-capacity publish)');
+
+  -- FULL -> ACTIVE remains legal (a seat release may reopen the Event) — an
+  -- unchanged, pre-Phase-8 transition, re-asserted here in the same
+  -- capacity-model context rather than assumed.
+  UPDATE events SET status = 'ACTIVE' WHERE id = ev3;
+  SELECT count(*) INTO n FROM event_status_history
+   WHERE event_id = ev3 AND from_status = 'FULL' AND to_status = 'ACTIVE';
+  PERFORM tw_assert(n = 1, 'guest seats: FULL->ACTIVE remains a legal, audited transition');
+END $host_fills$;
+
+-- No such status as OVERFULL was invented by this workstream, or exists at
+-- all — a seat-overrun is expressed as a rejected INSERT/UPDATE via the
+-- reserved_seat_count CHECK, never as a distinct Event status.
+SELECT tw_expect_error($$
+  UPDATE events SET status = 'OVERFULL' WHERE id = (SELECT id FROM events WHERE title = 'Host Fills Own Event')
+$$, 'guest seats: no such status as OVERFULL exists in the enum', '22P02');
 
 
 -- ---------------------------------------------------------------------------
@@ -450,31 +616,38 @@ SELECT tw_assert(
 
 -- ---------------------------------------------------------------------------
 -- 10. Reviews anti-abuse
+--
+-- WS8.0 (Phase8TrustReviews) added reviewer_type NOT NULL, dropping its
+-- transient DEFAULT — every INSERT below predates that migration and must
+-- now supply it explicitly. Alice/Bob/Carol are plain traveller reviewers
+-- (reviewer_provider_id stays NULL throughout this section), so
+-- reviewer_type = 'TRAVELLER' in every case, matching
+-- reviews_reviewer_provider_chk.
 -- ---------------------------------------------------------------------------
 SELECT tw_expect_error(format($$
-  INSERT INTO reviews (reviewer_user_id, target_type, target_user_id, event_id, rating)
-  VALUES (%L, 'USER', %L, %L, 5)
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_user_id, event_id, rating)
+  VALUES (%L, 'TRAVELLER', 'USER', %L, %L, 5)
 $$, tw_id('alice'), tw_id('alice'), tw_id('event')),
   'review: self-review rejected', '23514');
 
-INSERT INTO reviews (reviewer_user_id, target_type, target_user_id, event_id, rating)
-VALUES (tw_id('alice'), 'USER', tw_id('host'), tw_id('event'), 5);
+INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_user_id, event_id, rating)
+VALUES (tw_id('alice'), 'TRAVELLER', 'USER', tw_id('host'), tw_id('event'), 5);
 
 SELECT tw_expect_error(format($$
-  INSERT INTO reviews (reviewer_user_id, target_type, target_user_id, event_id, rating)
-  VALUES (%L, 'USER', %L, %L, 1)
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_user_id, event_id, rating)
+  VALUES (%L, 'TRAVELLER', 'USER', %L, %L, 1)
 $$, tw_id('alice'), tw_id('host'), tw_id('event')),
   'review: one review per (reviewer, event, reviewee)', '23505');
 
 SELECT tw_expect_error(format($$
-  INSERT INTO reviews (reviewer_user_id, target_type, target_user_id, event_id, rating)
-  VALUES (%L, 'USER', %L, %L, 9)
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_user_id, event_id, rating)
+  VALUES (%L, 'TRAVELLER', 'USER', %L, %L, 9)
 $$, tw_id('bob'), tw_id('host'), tw_id('event')),
   'review: rating outside 1..5 rejected', '23514');
 
 SELECT tw_expect_error(format($$
-  INSERT INTO reviews (reviewer_user_id, target_type, target_user_id, rating, is_verified)
-  VALUES (%L, 'USER', %L, 5, TRUE)
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_user_id, rating, is_verified)
+  VALUES (%L, 'TRAVELLER', 'USER', %L, 5, TRUE)
 $$, tw_id('bob'), tw_id('host')),
   'review: verified review requires an event context', '23514');
 
@@ -805,10 +978,12 @@ DECLARE
   r1 UUID; r2 UUID; r3 UUID;
   avg_now NUMERIC; cnt_now INT;
 BEGIN
-  INSERT INTO reviews (reviewer_user_id, target_type, target_provider_id, rating, moderation_state)
-  VALUES (tw_id('alice'), 'PROVIDER', prov, 4, 'APPROVED') RETURNING id INTO r1;
-  INSERT INTO reviews (reviewer_user_id, target_type, target_provider_id, rating, moderation_state)
-  VALUES (tw_id('bob'), 'PROVIDER', prov, 5, 'APPROVED') RETURNING id INTO r2;
+  -- reviewer_type describes the REVIEWER (Alice/Bob, plain travellers),
+  -- not the target — 'TRAVELLER' regardless of target_type = 'PROVIDER'.
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_provider_id, rating, moderation_state)
+  VALUES (tw_id('alice'), 'TRAVELLER', 'PROVIDER', prov, 4, 'APPROVED') RETURNING id INTO r1;
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_provider_id, rating, moderation_state)
+  VALUES (tw_id('bob'), 'TRAVELLER', 'PROVIDER', prov, 5, 'APPROVED') RETURNING id INTO r2;
 
   SELECT rating_avg, rating_count INTO avg_now, cnt_now FROM providers WHERE id = prov;
   PERFORM tw_assert(avg_now = 4.50 AND cnt_now = 2,
@@ -816,8 +991,8 @@ BEGIN
     format('avg=%s count=%s', avg_now, cnt_now));
 
   -- An unmoderated review must not move the public rating.
-  INSERT INTO reviews (reviewer_user_id, target_type, target_provider_id, rating, moderation_state)
-  VALUES (tw_id('carol'), 'PROVIDER', prov, 1, 'PENDING') RETURNING id INTO r3;
+  INSERT INTO reviews (reviewer_user_id, reviewer_type, target_type, target_provider_id, rating, moderation_state)
+  VALUES (tw_id('carol'), 'TRAVELLER', 'PROVIDER', prov, 1, 'PENDING') RETURNING id INTO r3;
 
   SELECT rating_avg, rating_count INTO avg_now, cnt_now FROM providers WHERE id = prov;
   PERFORM tw_assert(avg_now = 4.50 AND cnt_now = 2,
@@ -1036,9 +1211,21 @@ BEGIN
   PERFORM tw_assert(seats = 1, 'retry: seat consumed on approval', format('count=%s', seats));
 
   -- ---- capture fails permanently; compensation runs -------------------
+  -- WS8.4B: same cancellation-consistency requirement as sections 5/5b.
+  -- This scenario is neither a deliberate VOLUNTARY_LEAVE nor a
+  -- HOST_REMOVAL — it's a system-driven compensating cancellation after
+  -- the traveller's own payment capture permanently failed, and
+  -- event_participant_cancellation_reason has no third value for that (no
+  -- schema/migration change is made here to add one). VOLUNTARY_LEAVE is
+  -- the closer of the two available values: the row change is scoped to
+  -- the traveller's own participation and payment, with no host action
+  -- anywhere in this scenario, so cancelled_by_user_id = usr (the
+  -- traveller themselves) is the only self-consistent actor available.
   UPDATE payments SET status = 'FAILED', capture_requested_at = now() WHERE id = pay1;
   UPDATE event_participants
-     SET cancelled_at = now(), attendance_status = 'CANCELLED' WHERE id = part1;
+     SET cancelled_at = now(), attendance_status = 'CANCELLED',
+         cancellation_reason = 'VOLUNTARY_LEAVE', cancelled_by_user_id = usr
+   WHERE id = part1;
   UPDATE event_join_requests SET status = 'PAYMENT_FAILED' WHERE id = jr1;
 
   SELECT participant_count INTO seats FROM events WHERE id = ev;
@@ -1094,12 +1281,27 @@ SELECT tw_expect_error(format($$
 $$, tw_id('retry_event'), tw_id('retry_user')),
   'retry: a SECOND active participation is still rejected', '23505');
 
--- And a second live join request must still be impossible.
-SELECT tw_expect_error(format($$
+-- WS8.4B: event_join_requests_pending_uk only blocks an OUTSTANDING
+-- (status = 'PENDING') request — jr1 here is PAYMENT_FAILED and jr2 is
+-- APPROVED, neither PENDING, so a third request for the same (event, user)
+-- must now be PERMITTED. This replaces the pre-WS8.4B expectation this
+-- test used to assert (a second live request always rejected regardless
+-- of the first's decided status) — see event_join_requests_pending_uk's
+-- own migration comment ("multiple APPROVED requests over time... are the
+-- expected shape of a leave-then-rejoin cycle, not a bug").
+DO $retry_rejoin$
+DECLARE jr3 UUID;
+BEGIN
   INSERT INTO event_join_requests (event_id, user_id, expires_at)
-  VALUES (%L, %L, now() + INTERVAL '24 hours')
-$$, tw_id('retry_event'), tw_id('retry_user')),
-  'retry: a SECOND live join request is still rejected', '23505');
+  VALUES (tw_id('retry_event'), tw_id('retry_user'), now() + INTERVAL '24 hours')
+  RETURNING id INTO jr3;
+  PERFORM tw_assert(
+    EXISTS (SELECT 1 FROM event_join_requests WHERE id = jr3 AND status = 'PENDING'),
+    'retry: a third join request is permitted once no PENDING request remains (WS8.4B)');
+EXCEPTION WHEN OTHERS THEN
+  PERFORM tw_assert(FALSE,
+    'retry: a third join request is permitted once no PENDING request remains (WS8.4B)', SQLERRM);
+END $retry_rejoin$;
 
 
 -- ---------------------------------------------------------------------------

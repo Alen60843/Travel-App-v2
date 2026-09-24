@@ -473,6 +473,33 @@ describe('WS8.4B participant leave / organizer remove', () => {
     expect(participant.attendanceStatus).toBe('CANCELLED');
   });
 
+  // Real-Postgres correction: a leave-then-rejoin cycle (WS8.4B) deliberately
+  // leaves multiple EventParticipant rows for the same (event, user) as
+  // truthful history. Without an explicit order, the lookup could
+  // non-deterministically target an already-cancelled historical row instead
+  // of the current active one, silently no-op'ing instead of actually
+  // cancelling the active membership. joinedAt DESC deterministically
+  // selects the most recently created row.
+  it('selects the most recently created participant row (joinedAt DESC), not an arbitrary one', async () => {
+    const calls: string[] = [];
+    const event = buildEvent({ status: 'ACTIVE' });
+    const participant = buildParticipant();
+    const chat = mockChat();
+    const { manager, participantRepository } = buildManager({
+      event, participant, calls, eventAfterCancel: { participantCount: 4, reservedSeatCount: 4 },
+    });
+    const service = new JoinRequestsService(
+      buildEventsRepository(manager, event) as unknown as EventsRepository,
+      chat as unknown as ChatRepository,
+    );
+
+    await service.leave(participantUserId, eventId);
+
+    expect(participantRepository.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({ order: { joinedAt: 'DESC' } }),
+    );
+  });
+
   // 2. participant may leave a FULL event before starts_at.
   it('lets a participant leave a FULL event before starts_at', async () => {
     const calls: string[] = [];
@@ -1199,5 +1226,226 @@ describe('WS8.5B party size / guest seats', () => {
       expect(result.capacityBeforeOverride).toBeNull();
       expect(result.capacityAfterOverride).toBeNull();
     });
+  });
+
+  // WS8.5D: legacy capacity snapshot honesty (WS8.6A audit findings #1/#2).
+  describe('legacy capacity snapshot (WS8.5D)', () => {
+    function buildHostManager(opts: { event: ReturnType<typeof buildEvent>; requests: Record<string, unknown>[] }) {
+      const requestRepository = { find: jest.fn(async () => opts.requests) };
+      const manager = {
+        getRepository: (entity: unknown) => {
+          if (entity === EventJoinRequestEntity) return requestRepository;
+          throw new Error('Unexpected repository access');
+        },
+      } as unknown as EntityManager;
+      const eventsRepository = {
+        transaction: async (work: (manager: EntityManager) => Promise<unknown>) => work(manager),
+        findOwnedEvent: jest.fn(async () => opts.event),
+      };
+      return new JoinRequestsService(eventsRepository as unknown as EventsRepository, mockChat() as unknown as ChatRepository);
+    }
+
+    function legacyRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'legacy-request', eventId, userId: participantUserId, status: 'APPROVED',
+        message: null, guestCount: 1,
+        requestedAt: new Date('2026-01-01T00:00:00Z'), expiresAt: new Date('2026-01-02T00:00:00Z'),
+        approvedAt: new Date('2026-01-01T01:00:00Z'), rejectedAt: null, cancelledAt: null, expiredAt: null,
+        decidedByUserId: hostUserId,
+        // WS8.5D: this JoinRequest predates the snapshot feature — both null.
+        capacityMaxAtRequest: null, reservedSeatCountAtRequest: null,
+        capacityOverrideApprovedAt: null, capacityOverrideApprovedByUserId: null,
+        capacityBeforeOverride: null, capacityAfterOverride: null,
+        ...overrides,
+      };
+    }
+
+    // 1/2/3. legacy row: snapshot unavailable, both fields null together,
+    // capacitySnapshotAvailable=false.
+    it('reports capacitySnapshotAvailable=false for a legacy JoinRequest with no recorded snapshot', async () => {
+      const event = buildEvent({ capacityMax: 10, reservedSeatCount: 7 });
+      const service = buildHostManager({ event, requests: [legacyRow()] });
+
+      const [view] = await service.listForHost(hostUserId, eventId);
+      if (!view) throw new Error('expected exactly one JoinRequestView');
+
+      expect(view.capacitySnapshotAvailable).toBe(false);
+      expect(view.capacityMaxAtRequest).toBeNull();
+      expect(view.reservedSeatCountAtRequest).toBeNull();
+    });
+
+    // 4. derived historical fields must not fabricate a value when the
+    // snapshot is unavailable — never false/0/current-Event values.
+    it('does not fabricate derived historical fields for a legacy request', async () => {
+      const event = buildEvent({ capacityMax: 10, reservedSeatCount: 7 });
+      const service = buildHostManager({ event, requests: [legacyRow()] });
+
+      const [view] = await service.listForHost(hostUserId, eventId);
+      if (!view) throw new Error('expected exactly one JoinRequestView');
+
+      expect(view.availableSeatsAtRequest).toBeNull();
+      expect(view.exceededCapacityAtRequest).toBeNull();
+      expect(view.exceededByAtRequest).toBeNull();
+    });
+
+    // 7. current/dynamic capacity fields remain fully populated for a legacy
+    // request — the missing historical snapshot does not affect NOW.
+    it('still reports current/dynamic capacity fields for a legacy request', async () => {
+      const event = buildEvent({ capacityMax: 10, reservedSeatCount: 7 }); // 3 remaining
+      const service = buildHostManager({ event, requests: [legacyRow({ guestCount: 1 })] }); // needs 2
+
+      const [view] = await service.listForHost(hostUserId, eventId);
+      if (!view) throw new Error('expected exactly one JoinRequestView');
+
+      expect(view.currentCapacityMax).toBe(10);
+      expect(view.currentReservedSeatCount).toBe(7);
+      expect(view.currentAvailableSeats).toBe(3);
+      expect(view.currentlyFits).toBe(true);
+      expect(view.currentOverrideRequired).toBe(false);
+      expect(view.currentExceedsBy).toBe(0);
+    });
+
+    // 5/6. a freshly-created JoinRequest always stores a real, non-null
+    // snapshot and reports capacitySnapshotAvailable=true.
+    it('stores a real non-null snapshot and reports capacitySnapshotAvailable=true for a new request', async () => {
+      const calls: string[] = [];
+      const event = buildEvent({ capacityMax: 10, reservedSeatCount: 7 });
+      const { manager, requestRepository } = buildCreateManager({ event, calls });
+
+      const result = await serviceFor(manager).create(participantUserId, eventId, { guestCount: 0 });
+
+      expect(requestRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ capacityMaxAtRequest: 10, reservedSeatCountAtRequest: 7 }),
+      );
+      expect(result.capacitySnapshotAvailable).toBe(true);
+      expect(result.capacityMaxAtRequest).toBe(10);
+      expect(result.reservedSeatCountAtRequest).toBe(7);
+    });
+
+    // A row that somehow had only one of the two fields null would violate
+    // the both-or-neither invariant the DB CHECK constraint enforces
+    // (event_join_requests_capacity_snapshot_chk) — the view layer treats
+    // "either is missing" as "snapshot unavailable" rather than assuming
+    // the other is trustworthy, as defense in depth alongside that CHECK.
+    it('treats a partially-null snapshot as unavailable (defense in depth)', async () => {
+      const event = buildEvent({ capacityMax: 10, reservedSeatCount: 7 });
+      const service = buildHostManager({
+        event,
+        requests: [legacyRow({ capacityMaxAtRequest: 10, reservedSeatCountAtRequest: null })],
+      });
+
+      const [view] = await service.listForHost(hostUserId, eventId);
+      if (!view) throw new Error('expected exactly one JoinRequestView');
+
+      expect(view.capacitySnapshotAvailable).toBe(false);
+      expect(view.availableSeatsAtRequest).toBeNull();
+    });
+  });
+});
+
+// Real-Postgres correction: create()'s live-request lookup previously matched
+// status IN (PENDING, APPROVED), contradicting event_join_requests_pending_uk
+// (WHERE status = 'PENDING') and the WS8.4B product decision that a
+// historical APPROVED request must never by itself block a rejoin — only an
+// ACTIVE EventParticipant should (EVENT_ALREADY_JOINED, checked separately).
+describe("JoinRequestsService.create() — live request scope (real-Postgres correction)", () => {
+  const hostUserId = 'host-user-livescope';
+  const participantUserId = 'participant-user-livescope';
+  const eventId = 'event-livescope';
+
+  function buildEvent(overrides: Record<string, unknown> = {}) {
+    return {
+      id: eventId, hostUserId, joinApprovalRequired: true,
+      status: 'ACTIVE', capacityMax: 10, reservedSeatCount: 1,
+      minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
+      ...overrides,
+    };
+  }
+
+  function buildManager(opts: {
+    event: ReturnType<typeof buildEvent>;
+    liveRequest: Record<string, unknown> | null;
+    participantExists: boolean;
+  }) {
+    const requestRepository = {
+      findOne: jest.fn(async () => opts.liveRequest),
+      save: jest.fn(async (row: Record<string, unknown>) => row),
+      create: jest.fn((values: Record<string, unknown>) => ({ id: 'new-request', ...values })),
+    };
+    const eventRepository = {
+      findOne: jest.fn(async () => opts.event),
+      findOneByOrFail: jest.fn(async () => opts.event),
+    };
+    const participantRepository = {
+      exists: jest.fn(async () => opts.participantExists),
+    };
+    const userRepository = {
+      findOne: jest.fn(async () => ({ id: participantUserId, accountStatus: 'ACTIVE', trustScore: 100, deletedAt: null })),
+    };
+    const restrictionRepository = { exists: jest.fn(async () => false) };
+    const manager = {
+      getRepository: (entity: unknown) => {
+        if (entity === EventJoinRequestEntity) return requestRepository;
+        if (entity === EventEntity) return eventRepository;
+        if (entity === EventParticipantEntity) return participantRepository;
+        if (entity === UserEntity) return userRepository;
+        if (entity === AccountRestrictionEntity) return restrictionRepository;
+        throw new Error('Unexpected repository access');
+      },
+    } as unknown as EntityManager;
+    const eventsRepository = {
+      transaction: async (work: (manager: EntityManager) => Promise<unknown>) => work(manager),
+    };
+    const service = new JoinRequestsService(eventsRepository as unknown as EventsRepository, mockChat() as unknown as ChatRepository);
+    return { service, requestRepository, participantRepository };
+  }
+
+  const pendingRow = {
+    id: 'live-pending', status: 'PENDING',
+    requestedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+  };
+
+  // 1. PENDING request blocks another request.
+  it('a PENDING request blocks a new request with JOIN_REQUEST_ALREADY_EXISTS', async () => {
+    const { service } = buildManager({ event: buildEvent(), liveRequest: pendingRow, participantExists: false });
+
+    await expect(service.create(participantUserId, eventId, {})).rejects.toMatchObject({
+      code: 'JOIN_REQUEST_ALREADY_EXISTS',
+    });
+  });
+
+  // 2. historical APPROVED request does NOT by itself block create() — proven
+  // directly by asserting the query only ever scopes to PENDING, a single
+  // value, never In([PENDING, APPROVED]).
+  it('scopes the live-request lookup to PENDING only, never APPROVED', async () => {
+    const { service, requestRepository } = buildManager({ event: buildEvent(), liveRequest: null, participantExists: false });
+
+    await service.create(participantUserId, eventId, {});
+
+    expect(requestRepository.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ status: 'PENDING' }) }),
+    );
+  });
+
+  // 3. an ACTIVE EventParticipant still blocks duplicate joining, independent
+  // of JoinRequest status.
+  it('an active EventParticipant still blocks creation with EVENT_ALREADY_JOINED, even with no PENDING request', async () => {
+    const { service } = buildManager({ event: buildEvent(), liveRequest: null, participantExists: true });
+
+    await expect(service.create(participantUserId, eventId, {})).rejects.toMatchObject({
+      code: 'EVENT_ALREADY_JOINED',
+    });
+  });
+
+  // 4. cancelled EventParticipant + historical APPROVED request allows
+  // rejoin: no live PENDING request, no active participant — the exact
+  // post-leave state a real rejoin is attempted from.
+  it('allows a new request once the participant is cancelled, even with a historical APPROVED request on record', async () => {
+    const { service, requestRepository } = buildManager({ event: buildEvent(), liveRequest: null, participantExists: false });
+
+    const result = await service.create(participantUserId, eventId, {});
+
+    expect(result.status).toBe('PENDING');
+    expect(requestRepository.save).toHaveBeenCalled();
   });
 });

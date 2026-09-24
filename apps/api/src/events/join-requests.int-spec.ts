@@ -90,6 +90,13 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
           `DELETE FROM event_status_history WHERE event_id IN
            (SELECT id FROM events WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1))`, [`${prefix}%`],
         );
+        // payments.event_id is ON DELETE RESTRICT — the financial-commitment
+        // cancellation-guard fixture inserts a real payments row referencing
+        // a tracked event, so it must be cleared before the event itself.
+        await manager.query(
+          `DELETE FROM payments WHERE event_id IN
+           (SELECT id FROM events WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1))`, [`${prefix}%`],
+        );
         await manager.query('DELETE FROM events WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)', [`${prefix}%`]);
         await manager.query('DELETE FROM users WHERE firebase_uid LIKE $1', [`${prefix}%`]);
         await manager.query('ALTER TABLE event_status_history ENABLE TRIGGER event_status_history_append_only');
@@ -104,6 +111,9 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     const before = Date.now();
     const request = await requests.create(traveller, target.id, { message: '😀'.repeat(500) });
     expect(request).toMatchObject({ eventId: target.id, userId: traveller, status: 'PENDING', approvedAt: null });
+    // WS8.5D: every request created after this migration always gets a real,
+    // non-null server-derived snapshot.
+    expect(request.capacitySnapshotAvailable).toBe(true);
     expect(Date.parse(request.requestedAt)).toBeGreaterThanOrEqual(before);
     expect(Date.parse(request.expiresAt) - Date.parse(request.requestedAt)).toBe(86_400_000);
     expect(await stored(request.id)).toMatchObject({ status: 'PENDING', payment_id: null, decided_by_user_id: null });
@@ -112,6 +122,7 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     expect(Object.keys(request).sort()).toEqual([
       'id', 'eventId', 'userId', 'status', 'message',
       'guestCount', 'requestedSeats',
+      'capacitySnapshotAvailable',
       'capacityMaxAtRequest', 'reservedSeatCountAtRequest', 'availableSeatsAtRequest',
       'exceededCapacityAtRequest', 'exceededByAtRequest',
       'currentCapacityMax', 'currentReservedSeatCount', 'currentAvailableSeats',
@@ -160,7 +171,8 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
   // is otherwise eligible for joining, so a new request may still be
   // created (PENDING, exceeding capacity, requiring override to approve).
   it('a FULL Event still accepts a new Join Request before starts_at', async () => {
-    const target = await event({ capacityMax: 1 });
+    // capacityMax: 2 = host's 1 physical seat + 1 for the traveller who fills it.
+    const target = await event({ capacityMax: 2 });
     const first = await requests.create(traveller, target.id, {});
     await requests.approve(host, target.id, first.id);
     expect((await events.getEvent(host, target.id)).status).toBe('FULL');
@@ -246,7 +258,8 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
   });
 
   it('approves once, creates exactly one participant, and records FULL through the audit trigger', async () => {
-    const target = await event({ capacityMax: 1 });
+    // capacityMax: 2 = host's 1 physical seat + 1 for the approved traveller.
+    const target = await event({ capacityMax: 2 });
     const request = await requests.create(traveller, target.id, {});
     const approved = await requests.approve(host, target.id, request.id);
     expect(approved).toMatchObject({ status: 'APPROVED', approvedAt: expect.any(String) });
@@ -266,7 +279,8 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
   });
 
   it('auto-approves free requests atomically without fabricating a host decision', async () => {
-    const target = await event({ capacityMax: 1, joinApprovalRequired: false });
+    // capacityMax: 2 = host's 1 physical seat + 1 for the auto-approved traveller.
+    const target = await event({ capacityMax: 2, joinApprovalRequired: false });
     const request = await requests.create(traveller, target.id, {});
     expect(request).toMatchObject({ status: 'APPROVED', approvedAt: expect.any(String) });
     expect(await stored(request.id)).toMatchObject({ decided_by_user_id: null, payment_id: null });
@@ -293,7 +307,11 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
   });
 
   it('rolls back the auto-approved request, participant and FULL audit together on transaction failure', async () => {
-    const target = await event({ capacityMax: 1, joinApprovalRequired: false });
+    // capacityMax: 2 = host's 1 physical seat + 1 for the would-be auto-approved
+    // traveller — with capacityMax: 1 the host alone already fills the Event
+    // at publish time (status FULL immediately), which broke this test's
+    // post-rollback status: 'ACTIVE' assertion.
+    const target = await event({ capacityMax: 2, joinApprovalRequired: false });
     const failing = new JoinRequestsService(new (class extends EventsRepository {
       override transaction<T>(work: (manager: EntityManager) => Promise<T>): Promise<T> {
         return super.transaction(async (manager) => {
@@ -351,7 +369,9 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
   });
 
   it('two real connections race for the final seat: one commits, the loser remains PENDING', async () => {
-    const target = await event({ capacityMax: 2 });
+    // capacityMax: 3 = host's 1 physical seat + alreadySeated's 1 + exactly
+    // 1 contested seat for first/second to race over.
+    const target = await event({ capacityMax: 3 });
     const alreadySeated = await requests.create(await user(), target.id, {});
     await requests.approve(host, target.id, alreadySeated.id);
     const first = await requests.create(traveller, target.id, {});
@@ -400,7 +420,7 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     const rows = await participants(target.id);
     expect(rows).toHaveLength(2);
     expect(rows.filter((row: { join_request_id: string }) => [first.id, second.id].includes(row.join_request_id))).toHaveLength(1);
-    expect(await events.getEvent(host, target.id)).toMatchObject({ participantCount: 2, capacityMax: 2, status: 'FULL' });
+    expect(await events.getEvent(host, target.id)).toMatchObject({ participantCount: 2, capacityMax: 3, status: 'FULL' });
   });
 
   describe('WS5: EVENT chat provisioning', () => {
@@ -490,7 +510,8 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     });
 
     it('the existing last-seat race invariant is unaffected by chat provisioning: exactly one winner, and its EVENT chat membership is active', async () => {
-      const target = await event({ capacityMax: 1 });
+      // capacityMax: 2 = host's 1 physical seat + exactly 1 contested seat.
+      const target = await event({ capacityMax: 2 });
       const first = await requests.create(traveller, target.id, {});
       const second = await requests.create(outsider, target.id, {});
 
@@ -571,7 +592,8 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     });
 
     it('participant_count decrements via tw_sync_participant_count, and FULL bounces back to ACTIVE when a seat is freed', async () => {
-      const target = await event({ capacityMax: 1 });
+      // capacityMax: 2 = host's 1 physical seat + 1 for the approved traveller.
+      const target = await event({ capacityMax: 2 });
       await approvedParticipant(target);
       expect(await events.getEvent(host, target.id)).toMatchObject({ participantCount: 1, status: 'FULL' });
 
@@ -689,7 +711,14 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     it('refuses to cancel a participation carrying a financial commitment (payment_id set)', async () => {
       const target = await event();
       const { requestId } = await approvedParticipant(target);
-      await AppDataSource.query('UPDATE event_participants SET payment_id = gen_random_uuid() WHERE join_request_id = $1', [requestId]);
+      // A real payments row, not a bare random UUID — event_participants.payment_id
+      // is a genuine FK (REFERENCES payments(id)), predating Phase 8.
+      const [payment] = await AppDataSource.query(
+        `INSERT INTO payments (user_id, kind, event_id, provider, amount_minor, idempotency_key, status)
+         VALUES ($1, 'EVENT_DEPOSIT', $2, 'stripe', 1500, $3, 'AUTHORIZED') RETURNING id`,
+        [traveller, target.id, `join-int-payment-${requestId}`],
+      );
+      await AppDataSource.query('UPDATE event_participants SET payment_id = $1 WHERE join_request_id = $2', [payment.id, requestId]);
 
       await expect(requests.leave(traveller, target.id)).rejects.toMatchObject({
         code: 'PAID_PARTICIPATION_CANCELLATION_NOT_SUPPORTED',
@@ -785,11 +814,26 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
       expect(active?.guest_count).toBe(0);
     });
 
-    it('rejects a request whose party does not fit the current remaining physical capacity', async () => {
+    // WS8.5C superseded the WS8.5B behavior this test used to assert
+    // (creation itself rejected when over capacity). Creation is now always
+    // allowed regardless of fit — only ORDINARY APPROVAL is capacity-gated
+    // (see the 'ordinary approval rejects a currently-over-capacity request'
+    // test below). This test now proves the CURRENT behavior instead.
+    it('creates a request whose party does not fit current remaining physical capacity as PENDING, correctly flagged', async () => {
       const target = await event({ capacityMax: 3 }); // host alone reserves 1, 2 remain
       const traveller2 = await user();
 
-      await expect(requests.create(traveller2, target.id, { guestCount: 2 })).rejects.toMatchObject({
+      const request = await requests.create(traveller2, target.id, { guestCount: 2 }); // needs 3, exceeds by 1
+
+      expect(request.status).toBe('PENDING');
+      expect(request.capacityMaxAtRequest).toBe(3);
+      expect(request.reservedSeatCountAtRequest).toBe(1);
+      expect(request.exceededCapacityAtRequest).toBe(true);
+      expect(request.currentlyFits).toBe(false);
+      expect(request.currentOverrideRequired).toBe(true);
+
+      // Ordinary approval remains blocked — it still does not fit.
+      await expect(requests.approve(host, target.id, request.id)).rejects.toMatchObject({
         code: 'EVENT_CAPACITY_OVERRIDE_REQUIRED',
       });
     });
@@ -960,7 +1004,10 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
 
     it('rejects the override if the required capacity exceeds the technical ceiling', async () => {
       const target = await event({ capacityMax: 2 });
-      const request = await requests.create(traveller, target.id, { guestCount: 9998 }); // needs 9999 seats
+      // requiredCapacity = reservedSeatCount(host=1) + requestedSeats(1+9999=10000) = 10001,
+      // genuinely exceeding the 10,000 ceiling. guestCount: 9998 would only
+      // reach exactly 10,000, which is ALLOWED (only >10,000 must fail).
+      const request = await requests.create(traveller, target.id, { guestCount: 9999 }); // needs 10000 seats
 
       await expect(requests.approveWithCapacityOverride(host, target.id, request.id)).rejects.toMatchObject({
         code: 'EVENT_CAPACITY_OVERRIDE_LIMIT_EXCEEDED',

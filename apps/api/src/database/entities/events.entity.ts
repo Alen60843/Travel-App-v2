@@ -275,18 +275,27 @@ export class EventJoinRequestEntity {
   readonly guestCount!: number;
 
   /**
-   * WS8.5C: immutable server-derived snapshot of the Event's capacity state
-   * at the moment this request was created (read under the same Event-row
-   * lock create() already holds). Never rewritten. Combined with
+   * WS8.5C/WS8.5D: immutable server-derived snapshot of the Event's capacity
+   * state at the moment this request was created (read under the same
+   * Event-row lock create() already holds). Never rewritten. Combined with
    * guestCount, this is what lets "did this exceed capacity when
    * submitted, and by how much" stay answerable forever, independent of
    * whatever capacityMax/reservedSeatCount are NOW.
+   *
+   * Nullable: a JoinRequest created before this snapshot feature existed has
+   * no historically-true value to record — the WS8.6A audit found that
+   * backfilling it from the Event's CURRENT capacity would fabricate
+   * historical evidence, so legacy rows instead leave BOTH columns NULL
+   * (never one without the other — see
+   * event_join_requests_capacity_snapshot_chk) and the API surfaces this as
+   * capacitySnapshotAvailable=false rather than a fake answer. Every
+   * JoinRequest created from WS8.5D onward always has both populated.
    */
-  @Column({ type: 'integer', name: 'capacity_max_at_request' })
-  readonly capacityMaxAtRequest!: number;
+  @Column({ type: 'integer', name: 'capacity_max_at_request', nullable: true })
+  readonly capacityMaxAtRequest!: number | null;
 
-  @Column({ type: 'integer', name: 'reserved_seat_count_at_request' })
-  readonly reservedSeatCountAtRequest!: number;
+  @Column({ type: 'integer', name: 'reserved_seat_count_at_request', nullable: true })
+  readonly reservedSeatCountAtRequest!: number | null;
 
   /**
    * WS8.5C: capacity-override audit evidence. All four NULL together is the

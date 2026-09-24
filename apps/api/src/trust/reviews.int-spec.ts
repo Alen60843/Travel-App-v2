@@ -103,7 +103,51 @@ describe('reviews (real PostgreSQL)', () => {
 
   afterAll(async () => {
     try {
+      // Fixture-only cleanup, same pattern as join-requests.int-spec.ts:
+      // event_status_history is append-only (event_status_history_append_only
+      // forbids UPDATE/DELETE unconditionally, including cascade-induced
+      // deletes from event_id ON DELETE CASCADE), so a plain `DELETE FROM
+      // events` is rejected by production protection this suite must never
+      // weaken. The trigger is disabled only for the duration of this one
+      // transaction, scoped to exactly this suite's own tracked rows
+      // (UID_PREFIX); if any statement here fails, the whole transaction —
+      // including the DISABLE TRIGGER — rolls back, so the trigger is never
+      // left disabled outside this block.
+      //
+      // A second, independent obstacle: reviews.event_id is
+      // `REFERENCES events(id) ON DELETE SET NULL`, but
+      // reviews_forbid_content_mutation forbids ANY change to event_id
+      // (append-only content, not just append-only rows) — including a
+      // SET NULL cascade. Deleting this suite's own event-linked reviews
+      // explicitly, BEFORE deleting the events, means that cascade is never
+      // triggered at all, so the content-immutability trigger never needs
+      // touching (unlike event_status_history, it is not disabled here).
       await AppDataSource.transaction(async (manager) => {
+        await manager.query('ALTER TABLE event_status_history DISABLE TRIGGER event_status_history_append_only');
+        await manager.query(
+          `DELETE FROM event_status_history WHERE event_id IN (
+             SELECT id FROM events
+              WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)
+                 OR host_provider_id IN (
+                      SELECT id FROM providers WHERE owner_user_id IN (
+                        SELECT id FROM users WHERE firebase_uid LIKE $1
+                      )
+                    )
+           )`,
+          [`${UID_PREFIX}%`],
+        );
+        await manager.query(
+          `DELETE FROM reviews WHERE event_id IN (
+             SELECT id FROM events
+              WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)
+                 OR host_provider_id IN (
+                      SELECT id FROM providers WHERE owner_user_id IN (
+                        SELECT id FROM users WHERE firebase_uid LIKE $1
+                      )
+                    )
+           )`,
+          [`${UID_PREFIX}%`],
+        );
         await manager.query(
           `DELETE FROM events
             WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)
@@ -119,6 +163,7 @@ describe('reviews (real PostgreSQL)', () => {
           [`${UID_PREFIX}%`],
         );
         await manager.query(`DELETE FROM users WHERE firebase_uid LIKE $1`, [`${UID_PREFIX}%`]);
+        await manager.query('ALTER TABLE event_status_history ENABLE TRIGGER event_status_history_append_only');
       });
     } finally {
       await AppDataSource.destroy();

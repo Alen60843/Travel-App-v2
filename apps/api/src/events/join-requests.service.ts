@@ -26,16 +26,25 @@ export interface JoinRequestView {
   readonly guestCount: number;
   readonly requestedSeats: number;
 
-  // WS8.5C: immutable snapshot of capacity AT REQUEST TIME — never
+  // WS8.5C/WS8.5D: immutable snapshot of capacity AT REQUEST TIME — never
   // rewritten, independent of whatever capacityMax/reservedSeatCount are
   // now. "Your request was submitted for 3 seats when only 2 were
   // available" is exactly capacityMaxAtRequest/reservedSeatCountAtRequest/
   // requestedSeats.
-  readonly capacityMaxAtRequest: number;
-  readonly reservedSeatCountAtRequest: number;
-  readonly availableSeatsAtRequest: number;
-  readonly exceededCapacityAtRequest: boolean;
-  readonly exceededByAtRequest: number;
+  //
+  // capacitySnapshotAvailable=false means this JoinRequest predates the
+  // snapshot feature (WS8.5C) — the true request-time capacity state was
+  // never recorded and cannot be reconstructed (see the WS8.6A audit).
+  // When false, every field below is null — never a fabricated/estimated
+  // number, never current Event values presented as historical fact. Every
+  // JoinRequest created from WS8.5D onward always has
+  // capacitySnapshotAvailable=true with all fields populated.
+  readonly capacitySnapshotAvailable: boolean;
+  readonly capacityMaxAtRequest: number | null;
+  readonly reservedSeatCountAtRequest: number | null;
+  readonly availableSeatsAtRequest: number | null;
+  readonly exceededCapacityAtRequest: boolean | null;
+  readonly exceededByAtRequest: number | null;
 
   // WS8.5C: dynamic, computed from the Event's CURRENT capacity — distinct
   // from the snapshot above (a request that exceeded capacity when
@@ -105,8 +114,17 @@ export class JoinRequestsService {
     return this.command(async (manager) => {
       const event = await this.lockEvent(manager, eventId);
       const requests = manager.getRepository(EventJoinRequestEntity);
+      // WS8.4B/real-Postgres correction: only a PENDING request is "live" —
+      // matches event_join_requests_pending_uk (WHERE status = 'PENDING'),
+      // the DB's own authoritative uniqueness boundary. A historical
+      // APPROVED request must NEVER by itself block a new request; once its
+      // EventParticipant is cancelled, the user must be able to rejoin. That
+      // old APPROVED row is a permanent, truthful historical record — it is
+      // never mutated here. Current active membership is enforced entirely
+      // by the separate EVENT_ALREADY_JOINED check below (an active
+      // EventParticipant row), never by JoinRequest status.
       const live = await requests.findOne({
-        where: { eventId, userId, status: In([JoinRequestStatus.Pending, JoinRequestStatus.Approved]) },
+        where: { eventId, userId, status: JoinRequestStatus.Pending },
         lock: { mode: 'pessimistic_write' },
       });
       if (live && !(await this.expire(manager, live))) return joinError('JOIN_REQUEST_ALREADY_EXISTS');
@@ -129,9 +147,11 @@ export class JoinRequestsService {
         where: { eventId, userId, cancelledAt: IsNull() },
       })) return joinError('EVENT_ALREADY_JOINED');
 
-      // WS8.5C: server-derived snapshot, read under the same Event-row lock
-      // already held above — never client-suppliable, never rewritten
-      // after this INSERT.
+      // WS8.5C/WS8.5D: server-derived snapshot, read under the same
+      // Event-row lock already held above — never client-suppliable, never
+      // rewritten after this INSERT. Every JoinRequest created here always
+      // gets a real, non-null snapshot (capacitySnapshotAvailable=true in
+      // the view) — only rows that predate this feature are ever NULL.
       const capacityMaxAtRequest = event.capacityMax;
       const reservedSeatCountAtRequest = event.reservedSeatCount;
       const requestedSeats = 1 + guestCount;
@@ -304,8 +324,19 @@ export class JoinRequestsService {
     reason: EventParticipantCancellationReason,
   ): Promise<MembershipView | AppError> {
     const participants = manager.getRepository(EventParticipantEntity);
+    // A leave-then-rejoin cycle (WS8.4B) deliberately leaves MULTIPLE
+    // EventParticipant rows for the same (event, user) as truthful history —
+    // without an explicit order, "the" row is whichever one Postgres happens
+    // to return, which can silently pick an already-cancelled historical row
+    // instead of the current active one (or a different one on a retry) and
+    // make this whole method a no-op against stale history. joinedAt DESC
+    // deterministically selects the most recently created row: the active
+    // one when one exists (a rejoin always creates a newer row than any
+    // earlier cancellation), or the most-recently-cancelled one on a pure
+    // idempotent retry (no new row was created between calls).
     const participant = await participants.findOne({
       where: { eventId: event.id, userId: participantUserId },
+      order: { joinedAt: 'DESC' },
       lock: { mode: 'pessimistic_write' },
     });
     if (!participant) return joinError('EVENT_NOT_A_MEMBER');
@@ -638,8 +669,23 @@ export class JoinRequestsService {
    */
   private view(request: EventJoinRequestEntity, currentEvent?: Pick<EventEntity, 'capacityMax' | 'reservedSeatCount'>): JoinRequestView {
     const requestedSeats = 1 + request.guestCount;
-    const availableSeatsAtRequest = Math.max(0, request.capacityMaxAtRequest - request.reservedSeatCountAtRequest);
-    const exceededByAtRequest = Math.max(0, requestedSeats - availableSeatsAtRequest);
+
+    // WS8.5D: capacityMaxAtRequest/reservedSeatCountAtRequest are NULL
+    // together for a legacy pre-WS8.5C request (see the entity/migration
+    // comments) — every derived historical field must follow suit rather
+    // than silently treating a missing snapshot as 0/false. `== null` (not
+    // `!== null`) deliberately also treats `undefined` as "unavailable" —
+    // real rows from Postgres are always exactly `null`, never `undefined`,
+    // but this keeps the check equally honest for either.
+    const capacityMaxAtRequest = request.capacityMaxAtRequest;
+    const reservedSeatCountAtRequest = request.reservedSeatCountAtRequest;
+    const capacitySnapshotAvailable = capacityMaxAtRequest != null && reservedSeatCountAtRequest != null;
+    const availableSeatsAtRequest = capacitySnapshotAvailable
+      ? Math.max(0, capacityMaxAtRequest - reservedSeatCountAtRequest)
+      : null;
+    const exceededByAtRequest = availableSeatsAtRequest === null
+      ? null
+      : Math.max(0, requestedSeats - availableSeatsAtRequest);
 
     const currentAvailableSeats = currentEvent
       ? Math.max(0, currentEvent.capacityMax - currentEvent.reservedSeatCount)
@@ -650,10 +696,11 @@ export class JoinRequestsService {
       status: request.status, message: request.message,
       guestCount: request.guestCount, requestedSeats,
 
+      capacitySnapshotAvailable,
       capacityMaxAtRequest: request.capacityMaxAtRequest,
       reservedSeatCountAtRequest: request.reservedSeatCountAtRequest,
       availableSeatsAtRequest,
-      exceededCapacityAtRequest: exceededByAtRequest > 0,
+      exceededCapacityAtRequest: exceededByAtRequest === null ? null : exceededByAtRequest > 0,
       exceededByAtRequest,
 
       currentCapacityMax: currentEvent?.capacityMax ?? null,

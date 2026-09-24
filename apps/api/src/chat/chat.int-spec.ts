@@ -76,10 +76,23 @@ async function createUser(suffix: string): Promise<TestAccount> {
   return { id: user.id as string, firebaseUid };
 }
 
-async function createRoom(type: ChatRoomType = ChatRoomType.Match): Promise<string> {
+/**
+ * `eventId`/`providerId` are required for their matching type and forbidden
+ * otherwise — chat_rooms_context_chk (MATCH -> both NULL, EVENT ->
+ * event_id IS NOT NULL, PROVIDER_INQUIRY -> provider_id IS NOT NULL)
+ * rejects any other combination, and both columns carry real FKs, so
+ * neither can ever be seeded with a fabricated/non-existent id — callers
+ * must create a real Event/Provider first (see createEvent/createProvider
+ * below) and pass its id here.
+ */
+async function createRoom(
+  type: ChatRoomType = ChatRoomType.Match,
+  eventId: string | null = null,
+  providerId: string | null = null,
+): Promise<string> {
   const [room] = await AppDataSource.query(
-    `INSERT INTO chat_rooms (type) VALUES ($1) RETURNING id`,
-    [type],
+    `INSERT INTO chat_rooms (type, event_id, provider_id) VALUES ($1, $2, $3) RETURNING id`,
+    [type, eventId, providerId],
   );
   createdRoomIds.push(room.id as string);
   return room.id as string;
@@ -119,7 +132,11 @@ async function createEventCategoryOnce(): Promise<number> {
     `INSERT INTO event_categories (code, label, is_active, sort_order)
      VALUES ($1, $2, TRUE, 32767)
      RETURNING id`,
-    [`ws5-int-${RUN_ID}`, `WS5 integration ${RUN_ID.slice(0, 8)}`],
+    // event_categories_code_chk: ^[a-z0-9_]{2,40}$ — no hyphens allowed.
+    // RUN_ID is itself already hyphen-stripped (see its definition above),
+    // but the literal template text must avoid them too; total length here
+    // is 8 + 32 = 40, exactly at the constraint's upper bound.
+    [`ws5_int_${RUN_ID}`, `WS5 integration ${RUN_ID.slice(0, 8)}`],
   );
   ws5CategoryId = category.id as number;
   return ws5CategoryId;
@@ -139,6 +156,46 @@ async function createEvent(hostUserId: string): Promise<string> {
   );
   createdEventIds.push(event.id as string);
   return event.id as string;
+}
+
+/**
+ * A real, valid EVENT-typed chat_rooms row: creates a throwaway host user
+ * and a real Event first, since chat_rooms.event_id carries a genuine FK
+ * (never a fabricated UUID) and chat_rooms_context_chk requires
+ * event_id IS NOT NULL for type = 'EVENT'.
+ */
+async function createEventRoom(): Promise<string> {
+  const host = await createUser(`event-room-host-${randomUUID()}`);
+  const eventId = await createEvent(host.id);
+  return createRoom(ChatRoomType.Event, eventId);
+}
+
+const createdProviderIds: string[] = [];
+
+async function createProvider(): Promise<string> {
+  // providers_slug_chk: ^[a-z0-9][a-z0-9-]{1,78}[a-z0-9]$ — hyphens are
+  // allowed, but total length is capped at 80. UID_PREFIX (9 + 32 chars)
+  // plus a full hyphenated randomUUID() would exceed that, so this uses
+  // an 8-char hex suffix instead, matching this file's own RUN_ID.slice(0,8)
+  // convention for short unique labels.
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 8);
+  const [provider] = await AppDataSource.query(
+    `INSERT INTO providers (slug, name) VALUES ($1, $2) RETURNING id`,
+    [`${UID_PREFIX}-provider-${suffix}`, `Chat integration provider ${suffix}`],
+  );
+  createdProviderIds.push(provider.id as string);
+  return provider.id as string;
+}
+
+/**
+ * A real, valid PROVIDER_INQUIRY-typed chat_rooms row: creates a real
+ * Provider first, for the same reason createEventRoom creates a real Event
+ * — provider_id carries a genuine FK and chat_rooms_context_chk requires
+ * provider_id IS NOT NULL for type = 'PROVIDER_INQUIRY'.
+ */
+async function createProviderInquiryRoom(): Promise<string> {
+  const providerId = await createProvider();
+  return createRoom(ChatRoomType.ProviderInquiry, null, providerId);
 }
 
 describe('chat core: send TEXT message (real PostgreSQL)', () => {
@@ -167,10 +224,30 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
         ]);
       }
       if (createdEventIds.length > 0) {
-        // events.host_user_id is ON DELETE RESTRICT, so events must be
-        // removed before the users who host them, below.
-        await AppDataSource.query(`DELETE FROM events WHERE id = ANY($1::uuid[])`, [
-          createdEventIds,
+        // event_status_history is append-only (event_status_history_append_only
+        // forbids UPDATE/DELETE unconditionally, including the cascade delete
+        // from event_id ON DELETE CASCADE) — same pattern as
+        // join-requests.int-spec.ts / reviews.int-spec.ts. The trigger is
+        // disabled only for the duration of this one transaction, scoped to
+        // exactly this suite's own tracked event ids; if any statement here
+        // fails, the whole transaction — including the DISABLE TRIGGER —
+        // rolls back, so the trigger is never left disabled outside this
+        // block. events.host_user_id is ON DELETE RESTRICT, so events must
+        // still be removed before the users who host them, below.
+        await AppDataSource.transaction(async (manager) => {
+          await manager.query('ALTER TABLE event_status_history DISABLE TRIGGER event_status_history_append_only');
+          await manager.query(`DELETE FROM event_status_history WHERE event_id = ANY($1::uuid[])`, [
+            createdEventIds,
+          ]);
+          await manager.query(`DELETE FROM events WHERE id = ANY($1::uuid[])`, [
+            createdEventIds,
+          ]);
+          await manager.query('ALTER TABLE event_status_history ENABLE TRIGGER event_status_history_append_only');
+        });
+      }
+      if (createdProviderIds.length > 0) {
+        await AppDataSource.query(`DELETE FROM providers WHERE id = ANY($1::uuid[])`, [
+          createdProviderIds,
         ]);
       }
       await AppDataSource.query(`DELETE FROM users WHERE firebase_uid LIKE $1`, [
@@ -367,7 +444,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
     });
 
     it('does not broadcast for a PROVIDER_INQUIRY-type room (fail-closed: only MATCH/EVENT deliver)', async () => {
-      const room = await createRoom(ChatRoomType.ProviderInquiry);
+      const room = await createProviderInquiryRoom();
       const member = await createUser('broadcast-provider-inquiry-member');
       await addMember(room, member.id);
 
@@ -379,7 +456,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
 
   describe('WS3: EVENT group chat (deferred)', () => {
     it('an active EVENT member can send, and history/sync/read-state all work for a multi-member EVENT room', async () => {
-      const room = await createRoom(ChatRoomType.Event);
+      const room = await createEventRoom();
       const host = await createUser('event-host');
       const attendeeA = await createUser('event-attendee-a');
       const attendeeB = await createUser('event-attendee-b');
@@ -406,7 +483,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
     });
 
     it('rejects a non-member and a left member on every operation for an EVENT room', async () => {
-      const room = await createRoom(ChatRoomType.Event);
+      const room = await createEventRoom();
       const member = await createUser('event-reject-active');
       const stranger = await createUser('event-reject-stranger');
       const departed = await createUser('event-reject-departed');
@@ -439,7 +516,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
     });
 
     it('a duplicate clientMessageId retry persists the EVENT message once and broadcasts once', async () => {
-      const room = await createRoom(ChatRoomType.Event);
+      const room = await createEventRoom();
       const sender = await createUser('event-retry-sender');
       const other = await createUser('event-retry-other');
       await addMember(room, sender.id);
@@ -455,7 +532,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
     });
 
     it('broadcasts to every current active EVENT member, including the sender, using a fresh membership read', async () => {
-      const room = await createRoom(ChatRoomType.Event);
+      const room = await createEventRoom();
       const sender = await createUser('event-broadcast-sender');
       const memberB = await createUser('event-broadcast-b');
       const memberC = await createUser('event-broadcast-c');
@@ -471,7 +548,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
     });
 
     it('a member removed after an earlier message does not receive a later message', async () => {
-      const room = await createRoom(ChatRoomType.Event);
+      const room = await createEventRoom();
       const sender = await createUser('event-removal-sender');
       const leaving = await createUser('event-removal-leaving');
       await addMember(room, sender.id);
@@ -742,7 +819,7 @@ describe('chat core: send TEXT message (real PostgreSQL)', () => {
     });
 
     it('works identically for an EVENT-typed room (same generic membership query, no room-type branching)', async () => {
-      const room = await createRoom(ChatRoomType.Event);
+      const room = await createEventRoom();
       const requester = await createUser('presence-snapshot-event-requester');
       const attendeeA = await createUser('presence-snapshot-event-attendee-a');
       const attendeeB = await createUser('presence-snapshot-event-attendee-b');

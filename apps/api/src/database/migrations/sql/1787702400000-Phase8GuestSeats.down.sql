@@ -10,26 +10,42 @@
 -- a guest count to zero, deletes a historical request or participant, or
 -- silently undoes a capacity change.
 --
--- Deliberately NOT checked here (see the WS8.5B/WS8.5C reports' capacity-
--- semantics-downgrade analysis): capacity_max_at_request/
--- reserved_seat_count_at_request exist as NOT NULL on every row by this
--- point, so "any row has a snapshot" is true universally and would make
--- downgrade permanently impossible even on a pristine, untouched database —
--- over-strict beyond what the task asks ("at minimum detect" the concrete
--- list below). The snapshot columns are still dropped below; on a database
--- where none of the concrete conditions fire, their loss is provably inert
--- (no override was ever exceptional, so the snapshot was never actually
--- consulted for anything beyond its own row).
+-- WS8.5D: capacity-semantic downgrade guard (the WS8.6A audit's finding #2).
 --
--- Also deliberately NOT resolved here: whether an untouched capacity_max
--- value (host_guest_count = 0, no override) can be safely reinterpreted
--- under the OLD "excludes host" meaning. It cannot be proven either way
--- from stored data alone — the column has always been a plain integer, and
--- nothing records which semantic regime a given value was chosen under.
--- This migration does not attempt that proof and does not alter
--- capacity_max's numeric value in either direction; the interpretation gap
--- is a known, documented, unresolved risk of downgrading at all (see the
--- report), not something silently patched over here.
+-- Under the OLD meaning, capacity_max bounded EventParticipant count alone
+-- and excluded the USER host entirely. Under the NEW meaning (this
+-- migration's up.sql), capacity_max bounds total physical occupancy
+-- INCLUDING the USER host. The same stored numeric capacity_max value
+-- cannot be proven compatible with pre-this-migration application code for
+-- any USER-hosted Event: nothing in this schema records which semantic
+-- regime a given value was chosen under, and no combination of
+-- guest_count/host_guest_count/override evidence being zero rules out a
+-- host having deliberately set or reviewed that number under the NEW
+-- meaning. The WS8.6A audit concluded the only provably-safe automated
+-- boundary is: if any USER-hosted Event row exists at all, refuse the
+-- downgrade outright — never adjust, estimate, or guess a converted value,
+-- and never rewrite/delete Event, participant, or history rows to force it
+-- through. Provider-hosted Events are unaffected: this workstream did not
+-- change provider-hosted capacity_max semantics, so they are not blocked by
+-- this guard (though may still be blocked by the guest-history guard below).
+DO $$
+DECLARE
+  user_hosted_events INT;
+BEGIN
+  SELECT count(*) INTO user_hosted_events FROM events WHERE host_type = 'USER';
+
+  IF user_hosted_events > 0 THEN
+    RAISE EXCEPTION
+      'Cannot downgrade Phase8GuestSeats: % USER-hosted Event row(s) exist. Downgrading would return capacity_max to a different semantic meaning (OLD: EventParticipant count, host excluded / NEW: total physical occupancy, host included) for those rows. Safe conversion between the two meanings cannot be inferred automatically from stored data alone — no Event, EventParticipant, or JoinRequest row will be rewritten or deleted to force this downgrade through. Resolve this at the application/data level (e.g. remove or migrate USER-hosted Event data out of scope) before downgrading past Phase8GuestSeats.',
+      user_hosted_events
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+END $$;
+
+-- Pre-existing guest-history / capacity-override guard (WS8.5C), unchanged
+-- and unweakened — an ADDITIONAL, independent safety boundary from the one
+-- above (this one also fires for provider-hosted Events with genuine guest
+-- data, which the USER-hosted guard above does not cover).
 DO $$
 DECLARE
   join_request_guests INT;

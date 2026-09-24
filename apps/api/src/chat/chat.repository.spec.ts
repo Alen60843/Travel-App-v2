@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { ChatRoomType } from '@tripwith/shared';
 import type { DataSource, EntityManager } from 'typeorm';
 
+import { ChatRoomNotFoundError } from './chat.errors';
 import { ChatRepository } from './chat.repository';
 
 /**
@@ -179,6 +180,49 @@ describe('ChatRepository: WS5 chat-side integration contract', () => {
       await expect(
         repository.deactivateEventMember(manager as unknown as EntityManager, randomUUID(), randomUUID()),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  // Real-Postgres correction: TypeORM's manager.query() returns
+  // [rows, rowCount] for a raw UPDATE/DELETE statement (even with
+  // RETURNING), never a bare rows array — unlike INSERT/SELECT. These mock
+  // that exact tuple shape rather than a plain array, so a regression back
+  // to `const row = rows[0]` (reading the rows array itself as if it were
+  // a row) fails loudly here instead of only against a real database.
+  describe('advanceReadState', () => {
+    function makeTransactionalRepository(): {
+      repository: ChatRepository;
+      manager: jest.Mocked<Pick<EntityManager, 'query'>>;
+    } {
+      const manager = makeManager();
+      const dataSource = {
+        transaction: jest.fn((work: (manager: EntityManager) => Promise<unknown>) =>
+          work(manager as unknown as EntityManager)),
+      };
+      const repository = new ChatRepository(dataSource as unknown as DataSource);
+      return { repository, manager };
+    }
+
+    it("unwraps TypeORM's [rows, rowCount] UPDATE result and returns the new last_read_seq", async () => {
+      const { repository, manager } = makeTransactionalRepository();
+      manager.query
+        .mockResolvedValueOnce([{ '?column?': 1 }]) // assertActiveMember: active member found
+        .mockResolvedValueOnce([[{ last_read_seq: '7' }], 1]); // real TypeORM UPDATE ... RETURNING shape
+
+      const result = await repository.advanceReadState(randomUUID(), randomUUID(), 7);
+
+      expect(result).toBe(7);
+    });
+
+    it('throws ChatRoomNotFoundError when the guarded UPDATE affects no row', async () => {
+      const { repository, manager } = makeTransactionalRepository();
+      manager.query
+        .mockResolvedValueOnce([{ '?column?': 1 }]) // assertActiveMember: active member found
+        .mockResolvedValueOnce([[], 0]); // real TypeORM UPDATE ... RETURNING shape, 0 rows
+
+      await expect(repository.advanceReadState(randomUUID(), randomUUID(), 5)).rejects.toBeInstanceOf(
+        ChatRoomNotFoundError,
+      );
     });
   });
 });

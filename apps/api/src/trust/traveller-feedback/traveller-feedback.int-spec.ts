@@ -69,8 +69,8 @@ async function createEvent(options: CreateEventOptions): Promise<string> {
        capacity_max, starts_at, ends_at, meeting_point, status,
        cancelled_at
      ) VALUES ('USER',$1,$2,$3,10,${startsAt},${endsAt},
-               ST_SetSRID(ST_MakePoint(139.6917, 35.6895), 4326)::geography,$4,
-               CASE WHEN $4 = 'CANCELLED' THEN now() ELSE NULL END)
+               ST_SetSRID(ST_MakePoint(139.6917, 35.6895), 4326)::geography,$4::event_status,
+               CASE WHEN $4::event_status = 'CANCELLED' THEN now() ELSE NULL END)
      RETURNING id`,
     [options.hostUserId, categoryId, `Traveller feedback int event ${RUN_ID}`, status],
   );
@@ -83,9 +83,30 @@ interface AddParticipantOptions {
 
 async function addParticipant(eventId: string, userId: string, options: AddParticipantOptions = {}): Promise<void> {
   await AppDataSource.query(
-    `INSERT INTO event_participants (event_id, user_id, cancelled_at, attendance_status)
-     VALUES ($1, $2, CASE WHEN $3 THEN now() ELSE NULL END, CASE WHEN $3 THEN 'CANCELLED' ELSE 'UNKNOWN' END)`,
-    [eventId, userId, options.cancelled ?? false],
+    // Postgres infers an untyped CASE-of-string-literals expression as
+    // `text` by default; attendance_status is an enum column, so the
+    // expression needs an explicit cast rather than relying on implicit
+    // assignment coercion (which INSERT does not perform for enums).
+    // event_participants_cancel_consistency_chk (WS8.4B) requires
+    // cancellation_reason and cancelled_by_user_id to be NOT NULL together
+    // with cancelled_at — a self-cancellation (VOLUNTARY_LEAVE, actor = the
+    // participant themselves) is the correct minimal fixture value here.
+    // $4 is deliberately a SEPARATE placeholder bound to the same userId
+    // value as $2, not a reuse of $2 itself — reusing one placeholder
+    // across a plain column position and a CASE expression elsewhere in
+    // the same statement is exactly the parameter-type-inference conflict
+    // this file's own createEvent() fixture had (see RC4).
+    `INSERT INTO event_participants (
+       event_id, user_id, cancelled_at, attendance_status,
+       cancellation_reason, cancelled_by_user_id
+     )
+     VALUES (
+       $1, $2, CASE WHEN $3 THEN now() ELSE NULL END,
+       (CASE WHEN $3 THEN 'CANCELLED' ELSE 'UNKNOWN' END)::attendance_status,
+       CASE WHEN $3 THEN 'VOLUNTARY_LEAVE' ELSE NULL END::event_participant_cancellation_reason,
+       CASE WHEN $3 THEN $4::uuid ELSE NULL END
+     )`,
+    [eventId, userId, options.cancelled ?? false, userId],
   );
 }
 
@@ -99,12 +120,45 @@ describe('traveller feedback (real PostgreSQL)', () => {
 
   afterAll(async () => {
     try {
+      // Fixture-only cleanup, same pattern as join-requests.int-spec.ts.
+      // event_status_history is append-only (event_status_history_append_only
+      // forbids UPDATE/DELETE unconditionally, including the cascade delete
+      // from event_id ON DELETE CASCADE) — disabled only for the duration of
+      // this one transaction, scoped to exactly this suite's own tracked
+      // events; a failure anywhere rolls back the whole transaction
+      // (including the DISABLE TRIGGER), so it is never left disabled
+      // outside this block.
+      //
+      // traveller_feedback is ALSO append-only (traveller_feedback_append_only,
+      // reusing the same generic tw_forbid_mutation() guard) — and unlike
+      // reviews' content-immutability trigger (UPDATE-only), this one guards
+      // BOTH UPDATE OR DELETE unconditionally, so even an explicit direct
+      // DELETE of this suite's own rows is rejected unless the trigger is
+      // disabled too. Same transactional safety as event_status_history:
+      // scoped to this one cleanup transaction, restored before commit,
+      // and restored automatically via rollback if anything here fails.
       await AppDataSource.transaction(async (manager) => {
+        await manager.query('ALTER TABLE event_status_history DISABLE TRIGGER event_status_history_append_only');
+        await manager.query('ALTER TABLE traveller_feedback DISABLE TRIGGER traveller_feedback_append_only');
+        await manager.query(
+          `DELETE FROM event_status_history WHERE event_id IN (
+             SELECT id FROM events WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)
+           )`,
+          [`${UID_PREFIX}%`],
+        );
+        await manager.query(
+          `DELETE FROM traveller_feedback WHERE event_id IN (
+             SELECT id FROM events WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)
+           )`,
+          [`${UID_PREFIX}%`],
+        );
         await manager.query(
           `DELETE FROM events WHERE host_user_id IN (SELECT id FROM users WHERE firebase_uid LIKE $1)`,
           [`${UID_PREFIX}%`],
         );
         await manager.query(`DELETE FROM users WHERE firebase_uid LIKE $1`, [`${UID_PREFIX}%`]);
+        await manager.query('ALTER TABLE traveller_feedback ENABLE TRIGGER traveller_feedback_append_only');
+        await manager.query('ALTER TABLE event_status_history ENABLE TRIGGER event_status_history_append_only');
       });
     } finally {
       await AppDataSource.destroy();

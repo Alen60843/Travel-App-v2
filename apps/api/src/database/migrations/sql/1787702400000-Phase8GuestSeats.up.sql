@@ -276,6 +276,22 @@ END $$;
 --       capacityMax later changes for unrelated reasons (an override on a
 --       DIFFERENT request, a seat freeing up, etc.).
 --
+--       WS8.5D: both columns are NULLABLE. A JoinRequest that already
+--       existed before this migration has no historically-true value for
+--       either column — the true capacity state at ITS request time was
+--       never recorded anywhere, and nothing in this schema can recover it.
+--       This migration deliberately leaves both NULL for every pre-existing
+--       row rather than backfilling them from the Event's CURRENT
+--       capacity_max/reserved_seat_count, which would fabricate a precise-
+--       looking historical fact that was never actually true (see the
+--       WS8.6A audit finding on this exact point). The two columns are
+--       constrained to be NULL together or non-NULL together
+--       (event_join_requests_capacity_snapshot_chk below) — "snapshot
+--       unavailable" is a first-class, permanent, honest state, not an
+--       artifact of migration timing. Every JoinRequest created by
+--       JoinRequestsService.create() from this migration onward always
+--       supplies both, non-null, read under the Event lock at INSERT time.
+--
 --   (b) capacity_override_approved_at / _by_user_id /
 --       capacity_before_override / capacity_after_override — populated
 --       together, exactly once, ONLY when an actual override was used to
@@ -295,29 +311,18 @@ ALTER TABLE event_join_requests
   ADD COLUMN capacity_before_override INT,
   ADD COLUMN capacity_after_override INT;
 
--- Backfill for any pre-existing rows from this same not-yet-applied
--- migration's own WS8.5B section: capacity_max_at_request/
--- reserved_seat_count_at_request have no historically-true value to
--- recover (the concept did not exist when those rows were inserted), so
--- the best available honest value is each row's own Event's CURRENT
--- capacity/occupancy at migration time — an approximation, not a fabricated
--- precise historical fact. This only matters at all if this migration is
--- ever applied after real WS8.5A/B usage exists; in this workstream it has
--- not been applied to any live database.
-UPDATE event_join_requests r
-   SET capacity_max_at_request = e.capacity_max,
-       reserved_seat_count_at_request = e.reserved_seat_count
-  FROM events e
- WHERE e.id = r.event_id
-   AND r.capacity_max_at_request IS NULL;
-
-ALTER TABLE event_join_requests
-  ALTER COLUMN capacity_max_at_request SET NOT NULL,
-  ALTER COLUMN reserved_seat_count_at_request SET NOT NULL;
+-- WS8.5D: deliberately NO backfill. Pre-existing rows keep both columns
+-- NULL — see the column comments above and the WS8.6A audit finding this
+-- corrects. No historical reconstruction, estimation, or approximation from
+-- current Event state is performed.
 
 ALTER TABLE event_join_requests
   ADD CONSTRAINT event_join_requests_capacity_snapshot_chk
-    CHECK (capacity_max_at_request >= 1 AND reserved_seat_count_at_request >= 0);
+    CHECK (
+      (capacity_max_at_request IS NULL) = (reserved_seat_count_at_request IS NULL)
+      AND (capacity_max_at_request IS NULL OR capacity_max_at_request >= 1)
+      AND (reserved_seat_count_at_request IS NULL OR reserved_seat_count_at_request >= 0)
+    );
 
 ALTER TABLE event_join_requests
   ADD CONSTRAINT event_join_requests_capacity_override_chk CHECK (

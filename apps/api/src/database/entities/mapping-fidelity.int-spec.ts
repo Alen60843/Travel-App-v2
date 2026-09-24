@@ -163,8 +163,8 @@ describe('entity <-> database mapping fidelity (real database)', () => {
     }
   });
 
-  it('covers all 35 application tables', () => {
+  it('covers all 36 application tables', () => {
     const mappedTables = new Set(AppDataSource.entityMetadatas.map((m) => m.tableName));
-    expect(mappedTables.size).toBe(35);
+    expect(mappedTables.size).toBe(36);
   });
 });

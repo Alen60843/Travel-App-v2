@@ -341,7 +341,17 @@ export class ChatRepository {
     return this.dataSource.transaction(async (manager) => {
       await this.assertActiveMember(manager, roomId, userId);
 
-      const rows = await manager.query(
+      // TypeORM's manager.query() does NOT return a plain rows array for a
+      // raw UPDATE/DELETE statement, even with RETURNING — the pg driver
+      // reports this statement's command tag as "UPDATE" regardless of the
+      // RETURNING clause, and TypeORM's PostgresQueryRunner.query() special-
+      // cases UPDATE/DELETE to return [rows, rowCount] (see
+      // node_modules/typeorm/driver/postgres/PostgresQueryRunner.js). Only
+      // the default case (INSERT, SELECT) returns the bare rows array.
+      // Destructuring [rows] here unwraps that outer tuple; using `rows`
+      // directly (as if it were the rows array itself) silently reads
+      // .last_read_seq off the wrong value.
+      const [rows] = await manager.query(
         `WITH room AS (SELECT last_seq FROM chat_rooms WHERE id = $1)
          UPDATE chat_members cm
             SET last_read_seq = GREATEST(cm.last_read_seq, LEAST($3::bigint, room.last_seq))
@@ -349,8 +359,8 @@ export class ChatRepository {
           WHERE cm.room_id = $1 AND cm.user_id = $2 AND cm.left_at IS NULL
         RETURNING cm.last_read_seq`,
         [roomId, userId, requestedSeq],
-      );
-      const row = rows[0] as { readonly last_read_seq: string } | undefined;
+      ) as [Array<{ readonly last_read_seq: string }>, number];
+      const row = rows[0];
       if (!row) throw new ChatRoomNotFoundError();
 
       const finalSeq = bigintTransformer.from(row.last_read_seq);
