@@ -146,7 +146,14 @@ describe('JoinRequestsService (real PostgreSQL/PostGIS)', () => {
     await expect(requests.create(inactive, target.id, {})).rejects.toMatchObject({ code: 'JOIN_ACCOUNT_UNAVAILABLE' });
   });
 
-  it.each(['DRAFT', 'CANCELLED', 'IN_PROGRESS', 'COMPLETED', 'STARTED'])(
+  // Step 3 draft privacy closure: an unpublished Event must not be
+  // confirmable, so an unrelated requester gets the missing-Event answer.
+  it('answers an unrelated request on a DRAFT exactly like a missing Event', async () => {
+    const target = await event({}, host, false);
+    await expect(requests.create(traveller, target.id, {})).rejects.toBeInstanceOf(EventNotFoundError);
+  });
+
+  it.each(['CANCELLED', 'IN_PROGRESS', 'COMPLETED', 'STARTED'])(
     'rejects a %s Event', async (status) => {
       const target = await event({}, host, false);
       if (status !== 'DRAFT') await events.publishEvent(host, target.id);

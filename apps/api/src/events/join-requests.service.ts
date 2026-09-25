@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import {
   AttendanceStatus, canTransition, EventHostType, EventParticipantCancellationReason,
-  EventStatus, JoinRequestStatus, RestrictionType, UserAccountStatus,
+  EventStatus, EventVisibility, JoinRequestStatus, RestrictionType, UserAccountStatus,
 } from '@tripwith/shared';
 import { In, IsNull, LessThanOrEqual, MoreThan, type EntityManager } from 'typeorm';
 
@@ -118,6 +118,7 @@ export class JoinRequestsService {
       // deleted Provider) is not operational — no host could ever decide a
       // request or own the chat — so it is indistinguishable from not found.
       if (managerUserId === null) throw new EventNotFoundError();
+      await this.assertVisibleToRequester(manager, event, userId, managerUserId);
       const requests = manager.getRepository(EventJoinRequestEntity);
       // WS8.4B/real-Postgres correction: only a PENDING request is "live" —
       // matches event_join_requests_pending_uk (WHERE status = 'PENDING'),
@@ -636,6 +637,49 @@ export class JoinRequestsService {
     const requestedSeats = 1 + guestCount;
     const remainingSeats = event.capacityMax - event.reservedSeatCount;
     if (requestedSeats > remainingSeats) throw joinError('EVENT_CAPACITY_OVERRIDE_REQUIRED');
+  }
+
+  /**
+   * Prototype V1 privacy gate for create(): an UNRELATED user may open a new
+   * Join Request only on a PUBLIC Event (no invite-link semantics yet), so a
+   * guessed/leaked id of a PRIVATE or UNLISTED Event can never produce the
+   * PENDING request that would make them a related viewer of
+   * GET /v1/events/:eventId. The refusal is EventNotFoundError — exactly what
+   * Event Detail and a missing id return — and it is thrown BEFORE any other
+   * check, so status, trust, deposit or capacity errors can never confirm
+   * that a hidden Event exists. Throwing rolls the command back: nothing is
+   * written, not even a lazy expiry of an old request.
+   *
+   * DRAFT is refused the same way for every non-manager, whatever the
+   * visibility: an unpublished Event must never be confirmable before publish
+   * (Event Detail hides it too). No participant or request can exist on a
+   * DRAFT, so there is no other related user to preserve there.
+   *
+   * Related users keep their existing outcomes (the manager: EVENT_SELF_JOIN;
+   * an active participant: EVENT_ALREADY_JOINED; a live pending requester:
+   * JOIN_REQUEST_ALREADY_EXISTS). Historical rows are never touched, and
+   * approve/reject/override/leave/remove are unaffected. Other lifecycle
+   * states (CANCELLED, IN_PROGRESS, COMPLETED) keep EVENT_NOT_JOINABLE.
+   */
+  private async assertVisibleToRequester(
+    manager: EntityManager,
+    event: EventEntity,
+    userId: string,
+    managerUserId: string,
+  ): Promise<void> {
+    if (managerUserId === userId) return;
+    if (event.status === EventStatus.Draft) throw new EventNotFoundError();
+    if (event.visibility === EventVisibility.Public) return;
+    const isMember = await manager.getRepository(EventParticipantEntity).exists({
+      where: { eventId: event.id, userId, cancelledAt: IsNull() },
+    });
+    if (isMember) return;
+    const hasLivePendingRequest = await manager.getRepository(EventJoinRequestEntity).exists({
+      where: {
+        eventId: event.id, userId, status: JoinRequestStatus.Pending, expiresAt: MoreThan(new Date()),
+      },
+    });
+    if (!hasLivePendingRequest) throw new EventNotFoundError();
   }
 
   /**

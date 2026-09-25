@@ -197,7 +197,7 @@ describe('WS5 EVENT chat provisioning on approval', () => {
 
   function buildApprovableEvent() {
     return {
-      id: eventId, hostType: 'USER', hostUserId, joinApprovalRequired: true,
+      id: eventId, hostType: 'USER', visibility: 'PUBLIC', hostUserId, joinApprovalRequired: true,
       status: 'ACTIVE', participantCount: 0, capacityMax: 10,
       hostGuestCount: 0, reservedSeatCount: 1, // WS8.5C: host alone, plenty of room
       minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
@@ -488,7 +488,7 @@ describe('WS8.4B participant leave / organizer remove', () => {
 
   function buildEvent(overrides: Record<string, unknown> = {}) {
     return {
-      id: eventId, hostType: 'USER', hostUserId, status: 'ACTIVE',
+      id: eventId, hostType: 'USER', visibility: 'PUBLIC', hostUserId, status: 'ACTIVE',
       participantCount: 5, capacityMax: 10,
       // WS8.5B: hostGuestCount=0 -> reservedSeatCount mirrors participantCount
       // by default in these fixtures (one seat per participant, no guests) —
@@ -972,7 +972,7 @@ describe('WS8.5B party size / guest seats', () => {
 
   function buildEvent(overrides: Record<string, unknown> = {}) {
     return {
-      id: eventId, hostType: 'USER', hostUserId, joinApprovalRequired: true,
+      id: eventId, hostType: 'USER', visibility: 'PUBLIC', hostUserId, joinApprovalRequired: true,
       status: 'ACTIVE', capacityMax: 10, reservedSeatCount: 8,
       minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
       ...overrides,
@@ -1451,7 +1451,7 @@ describe("JoinRequestsService.create() — live request scope (real-Postgres cor
 
   function buildEvent(overrides: Record<string, unknown> = {}) {
     return {
-      id: eventId, hostType: 'USER', hostUserId, joinApprovalRequired: true,
+      id: eventId, hostType: 'USER', visibility: 'PUBLIC', hostUserId, joinApprovalRequired: true,
       status: 'ACTIVE', capacityMax: 10, reservedSeatCount: 1,
       minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
       ...overrides,
@@ -1543,5 +1543,134 @@ describe("JoinRequestsService.create() — live request scope (real-Postgres cor
 
     expect(result.status).toBe('PENDING');
     expect(requestRepository.save).toHaveBeenCalled();
+  });
+});
+
+// Step 3 privacy closure: create() must not let an unrelated user turn a
+// guessed PRIVATE/UNLISTED Event id into a PENDING request (and with it,
+// related-viewer access to GET /v1/events/:eventId).
+describe('JoinRequestsService.create() — V1 visibility gate', () => {
+  const hostUserId = 'host-user-visibility';
+  const travellerId = 'traveller-visibility';
+  const eventId = 'event-visibility';
+
+  function build(opts: {
+    visibility: string;
+    participantExists?: boolean;
+    livePending?: boolean;
+    trustScore?: number;
+    overrides?: Record<string, unknown>;
+  }) {
+    const event = {
+      id: eventId, hostType: 'USER', visibility: opts.visibility, hostUserId,
+      joinApprovalRequired: true, status: 'ACTIVE', capacityMax: 10, reservedSeatCount: 1,
+      minTrustScore: 5, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
+      ...opts.overrides,
+    };
+    const pendingRow = {
+      id: 'live-pending', status: 'PENDING', requestedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+    };
+    const requestRepository = {
+      exists: jest.fn(async () => opts.livePending ?? false),
+      findOne: jest.fn(async () => (opts.livePending ? pendingRow : null)),
+      save: jest.fn(async (row: Record<string, unknown>) => row),
+      create: jest.fn((values: Record<string, unknown>) => ({ id: 'new-request', ...values })),
+    };
+    const participantRepository = {
+      exists: jest.fn(async () => opts.participantExists ?? false),
+      insert: jest.fn(),
+    };
+    const userRepository = {
+      findOne: jest.fn(async () => ({ id: travellerId, accountStatus: 'ACTIVE', trustScore: opts.trustScore ?? 9, deletedAt: null })),
+    };
+    const manager = {
+      getRepository: (entity: unknown) => {
+        if (entity === EventJoinRequestEntity) return requestRepository;
+        if (entity === EventEntity) return { findOne: jest.fn(async () => event), findOneByOrFail: jest.fn(async () => event) };
+        if (entity === EventParticipantEntity) return participantRepository;
+        if (entity === UserEntity) return userRepository;
+        if (entity === AccountRestrictionEntity) return { exists: jest.fn(async () => false) };
+        throw new Error('Unexpected repository access');
+      },
+    } as unknown as EntityManager;
+    const chat = mockChat();
+    const service = new JoinRequestsService(
+      { transaction: async (work: (m: EntityManager) => Promise<unknown>) => work(manager) } as unknown as EventsRepository,
+      chat as unknown as ChatRepository,
+    );
+    return { service, requestRepository, participantRepository, chat };
+  }
+
+  it('accepts a normal request on a PUBLIC ACTIVE Event without consulting the gate', async () => {
+    const { service, requestRepository } = build({ visibility: 'PUBLIC' });
+
+    await expect(service.create(travellerId, eventId, {})).resolves.toMatchObject({ status: 'PENDING' });
+    expect(requestRepository.exists).not.toHaveBeenCalled();
+  });
+
+  it.each(['PRIVATE', 'UNLISTED'])(
+    'answers an unrelated request on a %s Event exactly like a missing Event and writes nothing',
+    async (visibility) => {
+      const { service, requestRepository, participantRepository, chat } = build({ visibility });
+
+      await expect(service.create(travellerId, eventId, { guestCount: 1 })).rejects.toBeInstanceOf(EventNotFoundError);
+      expect(requestRepository.save).not.toHaveBeenCalled();
+      expect(participantRepository.insert).not.toHaveBeenCalled();
+      expect(chat.ensureEventRoom).not.toHaveBeenCalled();
+      expect(chat.activateEventMember).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses before any other check, so trust/status/deposit errors cannot confirm a hidden Event exists', async () => {
+    for (const opts of [
+      { trustScore: 0 },
+      { overrides: { status: 'CANCELLED' } },
+      { overrides: { depositMinor: 500, priceMinor: 500 } },
+    ]) {
+      const { service } = build({ visibility: 'PRIVATE', ...opts });
+      await expect(service.create(travellerId, eventId, {})).rejects.toBeInstanceOf(EventNotFoundError);
+    }
+  });
+
+  it('keeps the existing outcomes for related users of a hidden Event', async () => {
+    await expect(build({ visibility: 'PRIVATE' }).service.create(hostUserId, eventId, {}))
+      .rejects.toMatchObject({ code: 'EVENT_SELF_JOIN' });
+    await expect(build({ visibility: 'PRIVATE', participantExists: true }).service.create(travellerId, eventId, {}))
+      .rejects.toMatchObject({ code: 'EVENT_ALREADY_JOINED' });
+    await expect(build({ visibility: 'UNLISTED', livePending: true }).service.create(travellerId, eventId, {}))
+      .rejects.toMatchObject({ code: 'JOIN_REQUEST_ALREADY_EXISTS' });
+  });
+
+  it('answers an unrelated request on a PUBLIC DRAFT like a missing Event, before any other check, and writes nothing', async () => {
+    for (const extra of [{}, { minTrustScore: 11 }, { depositMinor: 500, priceMinor: 500 }]) {
+      const { service, requestRepository, participantRepository, chat } = build({
+        visibility: 'PUBLIC', overrides: { status: 'DRAFT', ...extra },
+      });
+      await expect(service.create(travellerId, eventId, { guestCount: 2 })).rejects.toBeInstanceOf(EventNotFoundError);
+      expect(requestRepository.findOne).not.toHaveBeenCalled();
+      expect(requestRepository.save).not.toHaveBeenCalled();
+      expect(participantRepository.insert).not.toHaveBeenCalled();
+      expect(chat.ensureEventRoom).not.toHaveBeenCalled();
+    }
+  });
+
+  it('keeps the manager outcome on their own DRAFT and every non-DRAFT lifecycle answer unchanged', async () => {
+    await expect(build({ visibility: 'PUBLIC', overrides: { status: 'DRAFT' } }).service.create(hostUserId, eventId, {}))
+      .rejects.toMatchObject({ code: 'EVENT_SELF_JOIN' });
+    for (const status of ['CANCELLED', 'IN_PROGRESS', 'COMPLETED']) {
+      await expect(build({ visibility: 'PUBLIC', overrides: { status } }).service.create(travellerId, eventId, {}))
+        .rejects.toMatchObject({ code: 'EVENT_NOT_JOINABLE' });
+    }
+    await expect(build({ visibility: 'PUBLIC', overrides: { status: 'FULL' } }).service.create(travellerId, eventId, {}))
+      .resolves.toMatchObject({ status: 'PENDING' });
+  });
+
+  it('only counts a live (unexpired) PENDING request as a relationship', async () => {
+    const { service, requestRepository } = build({ visibility: 'PRIVATE' });
+
+    await expect(service.create(travellerId, eventId, {})).rejects.toBeInstanceOf(EventNotFoundError);
+    expect(requestRepository.exists).toHaveBeenCalledWith({
+      where: expect.objectContaining({ eventId, userId: travellerId, status: 'PENDING', expiresAt: expect.anything() }),
+    });
   });
 });
