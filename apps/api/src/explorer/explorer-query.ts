@@ -157,8 +157,9 @@ export function normalizeExplorerQuery(
     }
   }
 
-  // Past time never expands discovery. Clamping still includes an ACTIVE/FULL
-  // event that started earlier but overlaps the current instant.
+  // Past time never expands discovery. An already-started ACTIVE/FULL event is
+  // excluded separately by the repository's starts_at > now rule (it can no
+  // longer be joined), independent of this time-window overlap.
   const windowStart = new Date(Math.max(requestedStart.getTime(), now.getTime()));
   const categoryCodes = query.categoryCodes ?? [];
   if (
@@ -175,6 +176,7 @@ export function normalizeExplorerQuery(
 
   return {
     spatial: viewport ?? radius!,
+    now,
     windowStart,
     windowEnd,
     categoryCodes: sortedCategoryCodes,

@@ -1,13 +1,17 @@
-import { EventStatus } from '@tripwith/shared';
+import { EventHostType, EventStatus } from '@tripwith/shared';
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 
 import { GeoService, type LatLng, type SqlFragment } from '../database/geo';
+import type { PublicEventHostSummary } from '../events/event-detail.types';
+import { deriveEventGroupFormation } from '../events/event-group-state';
 import { ExplorerQueryTooBroadError } from './explorer.errors';
 import type {
   ExplorerClusterCategorySummary,
   ExplorerClusterMarker,
   ExplorerDiscoveryResult,
+  ExplorerEventCard,
+  ExplorerEventCardPage,
   ExplorerEventPin,
   ExplorerMarker,
   NormalizedExplorerQuery,
@@ -44,6 +48,35 @@ export const EXPLORER_CLUSTER_THROUGH_ZOOM = 14;
 // spheroidal geography result, including near-pole and dateline cases.
 const CONSERVATIVE_EARTH_RADIUS_METERS = 6_300_000;
 
+/**
+ * The ONE discoverable-Event rule, shared verbatim by the map CTE and the
+ * card list so the two populations can never diverge:
+ *
+ *   - PUBLIC, and ACTIVE or FULL (the original Explorer boundary);
+ *   - OPERATIONAL (Group Formation Step 2): USER-hosted, or a PROVIDER session
+ *     whose Provider is claimed (owner_user_id set) and not deleted — the
+ *     same "has a manager" fact as event-management.ts's
+ *     findEventManagerUserId; nobody can join or manage an unclaimed session;
+ *   - NOT YET STARTED (Step 5 joinable-time closure): starts_at strictly after
+ *     the normalized discovery instant (:discoveryNow), matching the join
+ *     flow, which refuses once starts_at <= now. A started-but-still-ACTIVE
+ *     or FULL Event is no longer something a stranger can request to join.
+ *
+ * Applied inside the map's MATERIALIZED privacy CTE, so an excluded Event
+ * never reaches a pin, cluster, category summary or eventCount. The time
+ * window filter (time_range overlap) is separate and unchanged.
+ */
+export const EXPLORER_DISCOVERABLE_EVENT_SQL = `event.visibility = 'PUBLIC'
+     AND event.status IN ('ACTIVE', 'FULL')
+     AND (event.host_type = 'USER'
+          OR EXISTS (
+               SELECT 1
+                 FROM providers operational_provider
+                WHERE operational_provider.id = event.host_provider_id
+                  AND operational_provider.owner_user_id IS NOT NULL
+                  AND operational_provider.deleted_at IS NULL))
+     AND event.starts_at > :discoveryNow`;
+
 const ADAPTIVE_CLUSTER_SQL = `
 WITH discoverable AS MATERIALIZED (
   SELECT event.id AS event_id,
@@ -59,8 +92,7 @@ WITH discoverable AS MATERIALIZED (
          event.meeting_point_label
     FROM events event
     JOIN event_categories category ON category.id = event.category_id
-   WHERE event.visibility = 'PUBLIC'
-     AND event.status IN ('ACTIVE', 'FULL')
+   WHERE ${EXPLORER_DISCOVERABLE_EVENT_SQL}
      AND event.time_range && tstzrange(:windowStart, :windowEnd, '[)')
      AND :spatialPredicate
      :categoryPredicate
@@ -195,6 +227,86 @@ SELECT discovery_stats.event_count AS "resultEventCount",
  LIMIT :markerLimit
 `;
 
+/**
+ * Prototype Step 5 list of discoverable Event / Session cards. Exactly the
+ * map's EXPLORER_DISCOVERABLE_EVENT_SQL boundary plus the same time-overlap,
+ * spatial and category predicates, so a card can only exist for an Event
+ * that could also be a pin. Host joins are narrow and
+ * display-only: profile display name/avatar of a non-deleted USER host, the
+ * Provider's id and name — never owner_user_id or contact data — and no
+ * participant, request, chat or payment table is read at all.
+ *
+ * Deterministic, explainable order: startsAt ASC, then id ASC. One extra row
+ * is fetched only to report hasMore.
+ */
+const EVENT_CARDS_SQL = `
+SELECT event.id AS "eventId",
+       event.title AS title,
+       event.description AS description,
+       event.host_type AS "hostType",
+       event.status AS status,
+       category.code AS "categoryCode",
+       category.label AS "categoryLabel",
+       category.icon AS "categoryIcon",
+       event.starts_at AS "startsAt",
+       event.ends_at AS "endsAt",
+       ST_Y(event.meeting_point::geometry) AS latitude,
+       ST_X(event.meeting_point::geometry) AS longitude,
+       event.meeting_point_label AS "meetingPointLabel",
+       event.capacity_min AS "capacityMin",
+       event.capacity_max AS "capacityMax",
+       event.reserved_seat_count AS "reservedSeatCount",
+       event.participant_count AS "participantCount",
+       event.price_minor AS "priceMinor",
+       event.currency AS currency,
+       event.join_approval_required AS "joinApprovalRequired",
+       event.host_user_id AS "hostUserId",
+       host_profile.display_name AS "hostDisplayName",
+       host_profile.avatar_url AS "hostAvatarUrl",
+       host_provider.id AS "hostProviderId",
+       host_provider.name AS "hostProviderName"
+  FROM events event
+  JOIN event_categories category ON category.id = event.category_id
+  LEFT JOIN users host_user
+         ON host_user.id = event.host_user_id AND host_user.deleted_at IS NULL
+  LEFT JOIN user_profiles host_profile ON host_profile.user_id = host_user.id
+  LEFT JOIN providers host_provider ON host_provider.id = event.host_provider_id
+ WHERE ${EXPLORER_DISCOVERABLE_EVENT_SQL}
+   AND event.time_range && tstzrange(:windowStart, :windowEnd, '[)')
+   AND :spatialPredicate
+   :categoryPredicate
+ ORDER BY event.starts_at ASC, event.id ASC
+ LIMIT :limitPlusOne
+`;
+
+interface ExplorerRawEventCard {
+  readonly eventId: string;
+  readonly title: string;
+  readonly description: string | null;
+  readonly hostType: EventHostType;
+  readonly status: EventStatus;
+  readonly categoryCode: string;
+  readonly categoryLabel: string;
+  readonly categoryIcon: string | null;
+  readonly startsAt: Date | string;
+  readonly endsAt: Date | string;
+  readonly latitude: string | number;
+  readonly longitude: string | number;
+  readonly meetingPointLabel: string | null;
+  readonly capacityMin: number | null;
+  readonly capacityMax: string | number;
+  readonly reservedSeatCount: string | number;
+  readonly participantCount: string | number;
+  readonly priceMinor: string | number;
+  readonly currency: string;
+  readonly joinApprovalRequired: boolean;
+  readonly hostUserId: string | null;
+  readonly hostDisplayName: string | null;
+  readonly hostAvatarUrl: string | null;
+  readonly hostProviderId: string | null;
+  readonly hostProviderName: string | null;
+}
+
 interface ExplorerDatabase {
   query<T = unknown>(query: string, parameters?: unknown[]): Promise<T>;
 }
@@ -252,6 +364,7 @@ export class ExplorerRepository {
       clusterCellDegrees: 90 / 2 ** query.zoom * clusterScale,
       candidateLimit: EXPLORER_AGGREGATION_LIMIT,
       candidateLimitPlusOne: EXPLORER_AGGREGATION_LIMIT + 1,
+      discoveryNow: query.now,
     });
     const rows = await this.dataSource.query<ExplorerRawMarker[]>(sql, values);
     if (rows.length === 0) throw new TypeError('Explorer query returned no discovery_stats row');
@@ -265,6 +378,30 @@ export class ExplorerRepository {
       throw new TypeError('Explorer query returned more markers than requested');
     }
     return { eventCount, markers };
+  }
+
+  /** Card list for the same discoverable population (see EVENT_CARDS_SQL); zoom is not used. */
+  async findDiscoverableEventCards(query: NormalizedExplorerQuery): Promise<ExplorerEventCardPage> {
+    const spatial = this.spatialPredicate(query);
+    const categoryPredicate = query.categoryCodes.length > 0
+      ? 'AND category.code = ANY(:categoryCodes::text[])'
+      : '';
+    const namedSql = EVENT_CARDS_SQL
+      .replace(':spatialPredicate', spatial.sql)
+      .replace(':categoryPredicate', categoryPredicate);
+    const { sql, values } = bindNamedParameters(namedSql, {
+      ...spatial.parameters,
+      windowStart: query.windowStart,
+      windowEnd: query.windowEnd,
+      categoryCodes: [...query.categoryCodes],
+      limitPlusOne: query.limit + 1,
+      discoveryNow: query.now,
+    });
+    const rows = await this.dataSource.query<ExplorerRawEventCard[]>(sql, values);
+    return {
+      cards: rows.slice(0, query.limit).map(toEventCard),
+      hasMore: rows.length > query.limit,
+    };
   }
 
   private spatialPredicate(query: NormalizedExplorerQuery): SqlFragment {
@@ -509,6 +646,57 @@ function isoInstant(value: Date | string | null, name: string): string {
   const parsed = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(parsed.getTime())) throw new TypeError(`Explorer query returned invalid ${name}`);
   return parsed.toISOString();
+}
+
+function toEventCard(row: ExplorerRawEventCard): ExplorerEventCard {
+  const capacityMax = finiteInteger(row.capacityMax, 'capacity max');
+  const reservedSeatCount = finiteInteger(row.reservedSeatCount, 'reserved seat count');
+  const status = requiredString(row.status, 'status') as EventStatus;
+  let host: PublicEventHostSummary;
+  if (row.hostType === EventHostType.Provider) {
+    host = {
+      type: 'PROVIDER',
+      providerId: requiredString(row.hostProviderId, 'host provider id'),
+      name: requiredString(row.hostProviderName, 'host provider name'),
+    };
+  } else {
+    host = {
+      type: 'USER',
+      userId: requiredString(row.hostUserId, 'host user id'),
+      displayName: row.hostDisplayName,
+      avatarUrl: row.hostAvatarUrl,
+    };
+  }
+  return {
+    eventId: requiredString(row.eventId, 'event ID'),
+    title: requiredString(row.title, 'title'),
+    description: row.description,
+    category: {
+      code: requiredString(row.categoryCode, 'category code'),
+      label: requiredString(row.categoryLabel, 'category label'),
+      icon: row.categoryIcon,
+    },
+    hostType: row.hostType,
+    host,
+    status,
+    startsAt: isoInstant(row.startsAt, 'startsAt'),
+    endsAt: isoInstant(row.endsAt, 'endsAt'),
+    coordinate: {
+      latitude: finiteCoordinate(row.latitude, 'latitude'),
+      longitude: finiteCoordinate(row.longitude, 'longitude'),
+    },
+    meetingPointLabel: row.meetingPointLabel,
+    capacityMin: row.capacityMin,
+    capacityMax,
+    reservedSeatCount,
+    remainingSeats: Math.max(0, capacityMax - reservedSeatCount),
+    participantCount: finiteInteger(row.participantCount, 'participant count'),
+    // The single Step 1 derivation — never a second copy in SQL or the client.
+    ...deriveEventGroupFormation({ status, capacityMin: row.capacityMin, reservedSeatCount }),
+    priceMinor: finiteInteger(row.priceMinor, 'price'),
+    currency: requiredString(row.currency, 'currency'),
+    joinApprovalRequired: row.joinApprovalRequired,
+  };
 }
 
 function toMarker(row: ExplorerRawMarker & { kind: 'event' | 'cluster' }): ExplorerMarker {

@@ -60,6 +60,7 @@ function rawCluster(eventCount = 5_500) {
 }
 
 const WINDOW = {
+  now: new Date('2090-01-01T00:00:00Z'),
   windowStart: new Date('2090-01-01T00:00:00Z'),
   windowEnd: new Date('2090-02-01T00:00:00Z'),
   categoryCodes: ['trek'],

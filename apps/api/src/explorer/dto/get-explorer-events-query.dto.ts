@@ -20,11 +20,12 @@ function queryStringArray(value: unknown): unknown[] {
 }
 
 /**
- * One endpoint supports both map interaction shapes. Cross-field rules such
- * as "exactly one complete spatial shape" and ordered time bounds are applied
- * by the query normalizer after this DTO validates each primitive.
+ * The shared area/time/category query for Explorer. Cross-field rules such as
+ * "exactly one complete spatial shape" and ordered time bounds are applied
+ * by the query normalizer after this DTO validates each primitive. Step 5
+ * (event cards) reuses it unchanged; only the map endpoint adds zoom.
  */
-export class GetExplorerEventsQueryDto {
+export class ExplorerAreaQueryDto {
   @IsOptional()
   @Type(() => Number)
   @IsNumber({ allowInfinity: false, allowNaN: false })
@@ -74,12 +75,6 @@ export class GetExplorerEventsQueryDto {
   @Max(500_000)
   radiusMeters?: number;
 
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(22)
-  zoom!: number;
-
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -107,4 +102,16 @@ export class GetExplorerEventsQueryDto {
   @IsString({ each: true })
   @Matches(/^[a-z0-9_]{2,40}$/, { each: true })
   categoryCodes?: string[];
+}
+
+/**
+ * One map endpoint supports both interaction shapes (viewport or radius); zoom
+ * drives only its adaptive marker clustering.
+ */
+export class GetExplorerEventsQueryDto extends ExplorerAreaQueryDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(22)
+  zoom!: number;
 }

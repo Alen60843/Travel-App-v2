@@ -1,4 +1,7 @@
-import type { EventStatus } from '@tripwith/shared';
+import type { EventHostType, EventStatus } from '@tripwith/shared';
+
+import type { PublicEventHostSummary } from '../events/event-detail.types';
+import type { EventGroupState } from '../events/event-group-state';
 
 export interface ExplorerCoordinate {
   readonly latitude: number;
@@ -54,6 +57,52 @@ export interface ExplorerEventsView {
   readonly markers: readonly ExplorerMarker[];
 }
 
+/**
+ * Prototype Step 5 "groups forming near you" card: enough to render a
+ * discovery card without opening Event Detail. Event-level facts only — no
+ * participant or request identities, no chat room, no viewer relationship
+ * (that is GET /v1/events/:eventId's job), never a serialized entity.
+ * Mobile renders copy such as "Needs 1 more" from groupState/seatsToConfirm.
+ */
+export interface ExplorerEventCard {
+  readonly eventId: string;
+  readonly title: string;
+  readonly description: string | null;
+  readonly category: ExplorerCategoryView;
+  readonly hostType: EventHostType;
+  /** Same public host summary as Event Detail; never providers.owner_user_id. */
+  readonly host: PublicEventHostSummary;
+  readonly status: EventStatus;
+  readonly startsAt: string;
+  readonly endsAt: string;
+  /** The host-chosen public meeting point, exactly as the map pins use it. */
+  readonly coordinate: ExplorerCoordinate;
+  readonly meetingPointLabel: string | null;
+  readonly capacityMin: number | null;
+  readonly capacityMax: number;
+  /** Physical travellers (party leaders + guests, plus a USER host's own party). */
+  readonly reservedSeatCount: number;
+  readonly remainingSeats: number;
+  /** Registered party leaders only; guests are never counted here. */
+  readonly participantCount: number;
+  readonly groupState: EventGroupState | null;
+  readonly seatsToConfirm: number | null;
+  readonly priceMinor: number;
+  readonly currency: string;
+  readonly joinApprovalRequired: boolean;
+}
+
+export interface ExplorerEventCardPage {
+  readonly cards: readonly ExplorerEventCard[];
+  readonly hasMore: boolean;
+}
+
+export interface ExplorerEventCardsView extends ExplorerEventCardPage {
+  readonly spatialMode: 'viewport' | 'radius';
+  readonly windowStart: string;
+  readonly windowEnd: string;
+}
+
 export interface ExplorerViewport {
   readonly kind: 'viewport';
   readonly south: number;
@@ -73,6 +122,12 @@ export type ExplorerSpatialQuery = ExplorerViewport | ExplorerRadius;
 
 export interface NormalizedExplorerQuery {
   readonly spatial: ExplorerSpatialQuery;
+  /**
+   * The single discovery instant the normalizer was given. Only Events with
+   * starts_at strictly after it are discoverable (they can still be joined);
+   * windowStart is clamped to it but may be later when a future window is asked for.
+   */
+  readonly now: Date;
   readonly windowStart: Date;
   readonly windowEnd: Date;
   readonly categoryCodes: readonly string[];
