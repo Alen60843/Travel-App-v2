@@ -44,6 +44,13 @@ export class UpdateEventDto {
   @Max(10_000)
   capacityMax?: number;
 
+  /** Group Formation: null clears the minimum; the resulting pair must satisfy capacityMin <= capacityMax (checked in EventsService). */
+  @ValidateIf((_object, value: unknown) => value !== undefined && value !== null)
+  @IsInt()
+  @Min(1)
+  @Max(10_000)
+  capacityMin?: number | null;
+
   /** WS8.5B: DRAFT-only editable (updateEvent itself requires DRAFT); frozen at publish. */
   @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsInt()

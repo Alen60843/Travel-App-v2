@@ -64,6 +64,7 @@ function eventFixture(overrides: Partial<EventEntity> = {}): EventEntity {
     status: EventStatus.Draft,
     visibility: EventVisibility.Public,
     capacityMax: 20,
+    capacityMin: null,
     participantCount: 0,
     hostGuestCount: 0,
     reservedSeatCount: 1,
@@ -371,5 +372,127 @@ describe('EventsService', () => {
         EventCancelNotAllowedError,
       );
     }
+  });
+
+  describe('Group Formation: capacityMin', () => {
+    it('persists an explicit capacityMin and serializes it with its derived fields', async () => {
+      const result = await service.createEvent(
+        USER_ID,
+        createDto({ capacityMin: 8, capacityMax: 12 }),
+      );
+
+      expect(repository.createEvent).toHaveBeenCalledWith(
+        manager,
+        expect.objectContaining({ capacityMin: 8, capacityMax: 12 }),
+      );
+      // A DRAFT forms no group yet; the arithmetic gap is still reported
+      // (host alone reserves 1 of the 8 required seats).
+      expect(result).toMatchObject({ capacityMin: 8, groupState: null, seatsToConfirm: 7 });
+    });
+
+    it('defaults capacityMin to null — no minimum — when omitted or explicitly null', async () => {
+      await service.createEvent(USER_ID, createDto());
+      await service.createEvent(USER_ID, createDto({ capacityMin: null }));
+
+      for (const [, values] of repository.createEvent.mock.calls) {
+        expect(values).toMatchObject({ capacityMin: null });
+      }
+    });
+
+    it('rejects a capacityMin greater than capacityMax', async () => {
+      await expect(
+        service.createEvent(USER_ID, createDto({ capacityMin: 13, capacityMax: 12 })),
+      ).rejects.toMatchObject({ details: { field: 'capacityMin' } });
+      expect(repository.createEvent).not.toHaveBeenCalled();
+    });
+
+    it('rejects a capacityMin of 0, a negative, or a non-integer', async () => {
+      for (const capacityMin of [0, -1, 2.5]) {
+        await expect(
+          service.createEvent(USER_ID, createDto({ capacityMin })),
+        ).rejects.toBeInstanceOf(InvalidEventValueError);
+      }
+      expect(repository.createEvent).not.toHaveBeenCalled();
+    });
+
+    it('accepts capacityMin equal to capacityMax', async () => {
+      const result = await service.createEvent(
+        USER_ID,
+        createDto({ capacityMin: 12, capacityMax: 12 }),
+      );
+      expect(result.capacityMin).toBe(12);
+    });
+
+    it('rejects lowering capacityMax below the stored capacityMin on update', async () => {
+      repository.findOwnedEvent.mockResolvedValue(eventFixture({ capacityMin: 8, capacityMax: 12 }));
+
+      await expect(
+        service.updateEvent(USER_ID, EVENT_ID, { capacityMax: 7 }),
+      ).rejects.toMatchObject({ details: { field: 'capacityMin' } });
+      expect(repository.saveEvent).not.toHaveBeenCalled();
+    });
+
+    it('accepts an update that changes both halves of the pair into a valid state', async () => {
+      repository.findOwnedEvent.mockResolvedValue(eventFixture({ capacityMin: 8, capacityMax: 12 }));
+
+      const updated = await service.updateEvent(USER_ID, EVENT_ID, { capacityMax: 6, capacityMin: 4 });
+
+      expect(updated).toMatchObject({ capacityMax: 6, capacityMin: 4 });
+    });
+
+    it('clears the minimum when capacityMin is patched to null, and keeps it when omitted', async () => {
+      repository.findOwnedEvent.mockResolvedValue(eventFixture({ capacityMin: 8 }));
+      const cleared = await service.updateEvent(USER_ID, EVENT_ID, { capacityMin: null });
+      expect(cleared).toMatchObject({ capacityMin: null, seatsToConfirm: null });
+
+      repository.findOwnedEvent.mockResolvedValue(eventFixture({ capacityMin: 8 }));
+      const kept = await service.updateEvent(USER_ID, EVENT_ID, { title: 'Renamed walk' });
+      expect(kept.capacityMin).toBe(8);
+    });
+
+    it('refuses to publish a drifted pair where capacityMin exceeds capacityMax', async () => {
+      repository.findOwnedEvent.mockResolvedValue(eventFixture({ capacityMin: 30, capacityMax: 20 }));
+
+      await expect(service.publishEvent(USER_ID, EVENT_ID, NOW)).rejects.toMatchObject({
+        details: { field: 'capacityMin' },
+      });
+      expect(repository.saveEvent).not.toHaveBeenCalled();
+    });
+
+    it('serializes FORMING / CONFIRMED from the stored counters, never from client input', async () => {
+      repository.findOwnedEventView.mockResolvedValue(
+        eventFixture({ status: EventStatus.Active, capacityMin: 8, capacityMax: 12, reservedSeatCount: 6 }),
+      );
+      await expect(service.getEvent(USER_ID, EVENT_ID)).resolves.toMatchObject({
+        groupState: 'FORMING',
+        seatsToConfirm: 2,
+        remainingSeats: 6,
+      });
+
+      repository.findOwnedEventView.mockResolvedValue(
+        eventFixture({ status: EventStatus.Active, capacityMin: 8, capacityMax: 12, reservedSeatCount: 9 }),
+      );
+      await expect(service.getEvent(USER_ID, EVENT_ID)).resolves.toMatchObject({
+        groupState: 'CONFIRMED',
+        seatsToConfirm: 0,
+      });
+    });
+
+    it('leaves an existing Event without a minimum unchanged apart from reporting OPEN', async () => {
+      const legacy = eventFixture({ status: EventStatus.Active, reservedSeatCount: 5 });
+      repository.findOwnedEventView.mockResolvedValue(legacy);
+
+      const view = await service.getEvent(USER_ID, EVENT_ID);
+
+      expect(view).toMatchObject({
+        capacityMin: null,
+        groupState: 'OPEN',
+        seatsToConfirm: null,
+        status: EventStatus.Active,
+        capacityMax: 20,
+        reservedSeatCount: 5,
+        remainingSeats: 15,
+      });
+    });
   });
 });

@@ -452,6 +452,69 @@ $$, 'guest seats: no such status as OVERFULL exists in the enum', '22P02');
 
 
 -- ---------------------------------------------------------------------------
+-- 5c. Group Formation minimum (events.capacity_min)
+--
+-- capacity_min is optional (NULL = no minimum; every pre-existing Event stays
+-- NULL) and, when set, must lie in [1, capacity_max]. FORMING / CONFIRMED are
+-- derived server-side from (status, capacity_min, reserved_seat_count) and are
+-- deliberately NOT event_status enum values.
+-- ---------------------------------------------------------------------------
+DO $group_min$
+DECLARE ev4 UUID; stored INT;
+BEGIN
+  INSERT INTO events (
+    host_type, host_user_id, category_id, title, capacity_max, capacity_min,
+    starts_at, ends_at, meeting_point, status
+  ) VALUES (
+    'USER', tw_id('host'), (SELECT id FROM event_categories WHERE code = 'trek'),
+    'Group Minimum Fixture', 12, 8,
+    now() + INTERVAL '13 days', now() + INTERVAL '13 days 3 hours',
+    ST_MakePoint(100.5018, 13.7563)::GEOGRAPHY, 'DRAFT'
+  ) RETURNING id INTO ev4;
+  INSERT INTO tw_ids VALUES ('event_group_min', ev4);
+
+  SELECT capacity_min INTO stored FROM events WHERE id = ev4;
+  PERFORM tw_assert(stored = 8, 'group minimum: capacity_min 8 <= capacity_max 12 is accepted',
+    format('capacity_min=%s', stored));
+
+  PERFORM tw_assert(
+    (SELECT capacity_min IS NULL FROM events WHERE id = tw_id('event')),
+    'group minimum: an Event created without capacity_min stays NULL (no default, no backfill)');
+END $group_min$;
+
+SELECT tw_expect_error(format($$
+  UPDATE events SET capacity_min = 0 WHERE id = %L
+$$, tw_id('event_group_min')), 'group minimum: capacity_min = 0 rejected', '23514');
+
+SELECT tw_expect_error(format($$
+  UPDATE events SET capacity_min = 13 WHERE id = %L
+$$, tw_id('event_group_min')), 'group minimum: capacity_min > capacity_max rejected', '23514');
+
+SELECT tw_expect_error(format($$
+  UPDATE events SET capacity_max = 7 WHERE id = %L
+$$, tw_id('event_group_min')),
+  'group minimum: lowering capacity_max below capacity_min rejected', '23514');
+
+DO $group_min_null$
+BEGIN
+  UPDATE events SET capacity_min = NULL WHERE id = tw_id('event_group_min');
+  PERFORM tw_assert(
+    (SELECT capacity_min IS NULL FROM events WHERE id = tw_id('event_group_min')),
+    'group minimum: capacity_min can be cleared back to NULL');
+END $group_min_null$;
+
+SELECT tw_expect_error(format($$
+  UPDATE events SET status = 'FORMING' WHERE id = %L
+$$, tw_id('event_group_min')),
+  'group minimum: FORMING is not a persisted event_status value', '22P02');
+
+SELECT tw_expect_error(format($$
+  UPDATE events SET status = 'CONFIRMED' WHERE id = %L
+$$, tw_id('event_group_min')),
+  'group minimum: CONFIRMED is not a persisted event_status value', '22P02');
+
+
+-- ---------------------------------------------------------------------------
 -- 6. Join requests
 -- ---------------------------------------------------------------------------
 INSERT INTO event_join_requests (event_id, user_id, expires_at)

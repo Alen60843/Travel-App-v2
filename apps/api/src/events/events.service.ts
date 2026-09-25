@@ -10,6 +10,7 @@ import type { EntityManager } from 'typeorm';
 import type { EventCategoryEntity, EventEntity } from '../database/entities';
 import { GeoService } from '../database/geo';
 import type { CreateEventDto, UpdateEventDto } from './dto';
+import { deriveEventGroupFormation } from './event-group-state';
 import {
   EmptyEventPatchError,
   EventAlreadyStartedError,
@@ -25,6 +26,7 @@ import {
 import { EventsRepository } from './events.repository';
 import type { EventView } from './events.types';
 import {
+  assertEventCapacityMin,
   assertEventInteger,
   assertEventMoney,
   assertEventTrustScore,
@@ -42,6 +44,7 @@ const CREATE_FIELDS = new Set([
   'description',
   'visibility',
   'capacityMax',
+  'capacityMin',
   'hostGuestCount',
   'priceMinor',
   'depositMinor',
@@ -75,6 +78,8 @@ export class EventsService {
     const visibility = dto.visibility ?? EventVisibility.Public;
     assertEventVisibility(visibility);
     assertEventInteger(dto.capacityMax, 'capacityMax', 1, 10_000);
+    const capacityMin = dto.capacityMin ?? null;
+    assertEventCapacityMin(capacityMin, dto.capacityMax);
     const hostGuestCount = dto.hostGuestCount ?? 0;
     assertEventInteger(hostGuestCount, 'hostGuestCount', 0, 9999);
     this.assertHostPartyFits(hostGuestCount, dto.capacityMax);
@@ -112,6 +117,7 @@ export class EventsService {
         status: EventStatus.Draft,
         visibility,
         capacityMax: dto.capacityMax,
+        capacityMin,
         hostGuestCount,
         priceMinor,
         depositMinor,
@@ -175,6 +181,10 @@ export class EventsService {
           'capacityMax cannot be lower than participantCount.',
         );
       }
+      // Validate the RESULTING pair: an explicit null clears the minimum,
+      // undefined keeps the stored one — which must still fit a lowered capacityMax.
+      const capacityMin = dto.capacityMin === undefined ? event.capacityMin : dto.capacityMin;
+      assertEventCapacityMin(capacityMin, capacityMax);
       const hostGuestCount = dto.hostGuestCount ?? event.hostGuestCount;
       assertEventInteger(hostGuestCount, 'hostGuestCount', 0, 9999);
       this.assertHostPartyFits(hostGuestCount, capacityMax);
@@ -211,6 +221,7 @@ export class EventsService {
         description,
         visibility,
         capacityMax,
+        capacityMin,
         hostGuestCount,
         priceMinor,
         depositMinor,
@@ -314,6 +325,7 @@ export class EventsService {
     if (event.participantCount > event.capacityMax) {
       throw new InvalidEventValueError('capacityMax', 'Event capacity has already been exceeded.');
     }
+    assertEventCapacityMin(event.capacityMin, event.capacityMax);
     assertEventInteger(event.hostGuestCount, 'hostGuestCount', 0, 9999);
     this.assertHostPartyFits(event.hostGuestCount, event.capacityMax);
     assertEventMoney(event.priceMinor, event.depositMinor);
@@ -384,6 +396,8 @@ export class EventsService {
       status: event.status,
       visibility: event.visibility,
       capacityMax: event.capacityMax,
+      capacityMin: event.capacityMin,
+      ...deriveEventGroupFormation(event),
       participantCount: event.participantCount,
       hostGuestCount: event.hostGuestCount,
       reservedSeatCount: event.reservedSeatCount,

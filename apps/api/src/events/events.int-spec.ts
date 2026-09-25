@@ -417,4 +417,138 @@ describe('EventsService (real PostgreSQL/PostGIS)', () => {
       EventPublishNotAllowedError,
     );
   });
+
+  describe('Group Formation: capacity_min', () => {
+    async function storedCapacity(eventId: string) {
+      const [row] = (await AppDataSource.query(
+        `SELECT capacity_min, capacity_max, reserved_seat_count FROM events WHERE id = $1`,
+        [eventId],
+      )) as Array<{ capacity_min: number | null; capacity_max: number; reserved_seat_count: number }>;
+      return row;
+    }
+
+    it('round-trips capacityMin through the service and the events column', async () => {
+      const owner = await createUser('min-roundtrip-owner');
+      const created = await service.createEvent(
+        owner.id,
+        draftInput({ title: 'Minimum round trip', capacityMin: 8, capacityMax: 12 }),
+      );
+
+      expect(created).toMatchObject({ capacityMin: 8, capacityMax: 12, groupState: null });
+      await expect(service.getEvent(owner.id, created.id)).resolves.toEqual(created);
+      await expect(storedCapacity(created.id)).resolves.toMatchObject({
+        capacity_min: 8,
+        capacity_max: 12,
+      });
+    });
+
+    it('enforces events_capacity_min_chk in PostgreSQL itself', async () => {
+      const owner = await createUser('min-constraint-owner');
+      const created = await service.createEvent(
+        owner.id,
+        draftInput({ title: 'Minimum constraint', capacityMin: 8, capacityMax: 12 }),
+      );
+      const violation = {
+        driverError: { code: '23514', constraint: 'events_capacity_min_chk' },
+      };
+
+      await expect(
+        AppDataSource.query(`UPDATE events SET capacity_min = 13 WHERE id = $1`, [created.id]),
+      ).rejects.toMatchObject(violation);
+      await expect(
+        AppDataSource.query(`UPDATE events SET capacity_min = 0 WHERE id = $1`, [created.id]),
+      ).rejects.toMatchObject(violation);
+      await expect(
+        AppDataSource.query(`UPDATE events SET capacity_max = 7 WHERE id = $1`, [created.id]),
+      ).rejects.toMatchObject(violation);
+      await expect(storedCapacity(created.id)).resolves.toMatchObject({
+        capacity_min: 8,
+        capacity_max: 12,
+      });
+
+      await AppDataSource.query(`UPDATE events SET capacity_min = NULL WHERE id = $1`, [
+        created.id,
+      ]);
+      await expect(storedCapacity(created.id)).resolves.toMatchObject({ capacity_min: null });
+    });
+
+    it('keeps legacy Events without a minimum NULL and OPEN once published', async () => {
+      const owner = await createUser('min-legacy-owner');
+      const draft = await service.createEvent(owner.id, draftInput({ title: 'No minimum' }));
+      expect(draft).toMatchObject({ capacityMin: null, groupState: null, seatsToConfirm: null });
+      await expect(storedCapacity(draft.id)).resolves.toMatchObject({ capacity_min: null });
+
+      await expect(service.publishEvent(owner.id, draft.id, NOW)).resolves.toMatchObject({
+        status: EventStatus.Active,
+        capacityMin: null,
+        groupState: 'OPEN',
+        seatsToConfirm: null,
+      });
+    });
+
+    it('derives FORMING, CONFIRMED, FULL, and CANCELLED from real seat counters', async () => {
+      const owner = await createUser('min-derived-owner');
+      const travellerA = await createUser('min-derived-traveller-a');
+      const travellerB = await createUser('min-derived-traveller-b');
+      const draft = await service.createEvent(
+        owner.id,
+        draftInput({ title: 'Derived group state', capacityMin: 3, capacityMax: 4 }),
+      );
+
+      // The USER host alone reserves one physical seat.
+      await expect(service.publishEvent(owner.id, draft.id, NOW)).resolves.toMatchObject({
+        status: EventStatus.Active,
+        reservedSeatCount: 1,
+        groupState: 'FORMING',
+        seatsToConfirm: 2,
+      });
+
+      // One participant bringing one guest: the DB trigger moves reserved to 3.
+      await AppDataSource.query(
+        `INSERT INTO event_participants (event_id, user_id, guest_count) VALUES ($1, $2, 1)`,
+        [draft.id, travellerA.id],
+      );
+      await expect(service.getEvent(owner.id, draft.id)).resolves.toMatchObject({
+        status: EventStatus.Active,
+        reservedSeatCount: 3,
+        groupState: 'CONFIRMED',
+        seatsToConfirm: 0,
+      });
+
+      await AppDataSource.transaction(async (manager) => {
+        await manager.query(
+          `INSERT INTO event_participants (event_id, user_id) VALUES ($1, $2)`,
+          [draft.id, travellerB.id],
+        );
+        await manager.query(
+          `SELECT set_config('tripwith.actor_user_id', $1, true),
+                  set_config('tripwith.transition_reason', 'test_capacity_full', true)`,
+          [owner.id],
+        );
+        await manager.query(`UPDATE events SET status = 'FULL' WHERE id = $1`, [draft.id]);
+      });
+      await expect(service.getEvent(owner.id, draft.id)).resolves.toMatchObject({
+        status: EventStatus.Full,
+        reservedSeatCount: 4,
+        groupState: 'FULL',
+        seatsToConfirm: 0,
+      });
+
+      await expect(
+        service.cancelEvent(owner.id, draft.id, new Date('2089-12-21T00:00:00Z')),
+      ).resolves.toMatchObject({ status: EventStatus.Cancelled, groupState: 'CANCELLED' });
+
+      // No persisted FORMING/CONFIRMED status ever reached the database.
+      const history = (await AppDataSource.query(
+        `SELECT to_status FROM event_status_history WHERE event_id = $1 ORDER BY created_at ASC, id ASC`,
+        [draft.id],
+      )) as Array<{ to_status: string }>;
+      expect(history.map((row) => row.to_status)).toEqual([
+        EventStatus.Draft,
+        EventStatus.Active,
+        EventStatus.Full,
+        EventStatus.Cancelled,
+      ]);
+    });
+  });
 });

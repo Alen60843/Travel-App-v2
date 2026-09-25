@@ -127,4 +127,26 @@ describe('EventsController', () => {
       cancellationPolicy: null,
     });
   });
+
+  // Group Formation: capacityMin is nullable on purpose (null = no minimum /
+  // clear it), but a supplied number must still be an integer in [1, 10000].
+  it.each([
+    ['create', CreateEventDto],
+    ['update', UpdateEventDto],
+  ] as const)('validates capacityMin on %s: null allowed, 0 and fractions rejected', async (_name, metatype) => {
+    const pipe = createValidationPipe();
+    const base = metatype === CreateEventDto ? { ...createDto } : {};
+
+    await expect(
+      pipe.transform({ ...base, capacityMin: null }, { type: 'body', metatype }),
+    ).resolves.toMatchObject({ capacityMin: null });
+    await expect(
+      pipe.transform({ ...base, capacityMin: 8 }, { type: 'body', metatype }),
+    ).resolves.toMatchObject({ capacityMin: 8 });
+    for (const capacityMin of [0, -3, 2.5, 10_001]) {
+      await expect(
+        pipe.transform({ ...base, capacityMin }, { type: 'body', metatype }),
+      ).rejects.toMatchObject({ code: 'VALIDATION_FAILED', status: 422 });
+    }
+  });
 });

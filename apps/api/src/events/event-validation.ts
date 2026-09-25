@@ -97,6 +97,20 @@ export function assertEventInteger(
   }
 }
 
+/**
+ * Group Formation: capacityMin (when set) must be an integer in
+ * [1, capacityMax]. Callers pass the RESULTING pair after any patch, so a
+ * capacityMax edit can never leave an existing capacityMin above it.
+ * events_capacity_min_chk remains the authoritative backstop.
+ */
+export function assertEventCapacityMin(capacityMin: number | null, capacityMax: number): void {
+  if (capacityMin === null) return;
+  assertEventInteger(capacityMin, 'capacityMin', 1, 10_000);
+  if (capacityMin > capacityMax) {
+    throw new InvalidEventValueError('capacityMin', 'capacityMin cannot exceed capacityMax.');
+  }
+}
+
 export function assertEventMoney(priceMinor: number, depositMinor: number): void {
   assertEventInteger(priceMinor, 'priceMinor', 0, 2_147_483_647);
   assertEventInteger(depositMinor, 'depositMinor', 0, 2_147_483_647);

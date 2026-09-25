@@ -4,6 +4,8 @@ import type {
   EventVisibility,
 } from '@tripwith/shared';
 
+import type { EventGroupState } from './event-group-state';
+
 export interface EventCategoryView {
   readonly id: number;
   readonly code: string;
@@ -28,6 +30,12 @@ export interface EventView {
   readonly status: EventStatus;
   readonly visibility: EventVisibility;
   readonly capacityMax: number;
+  /** Group Formation: minimum physical people before the Event is confirmed; null = no minimum. */
+  readonly capacityMin: number | null;
+  /** Derived (never stored) from status + capacityMin + reservedSeatCount; null for DRAFT/IN_PROGRESS/COMPLETED. */
+  readonly groupState: EventGroupState | null;
+  /** max(capacityMin - reservedSeatCount, 0); null when capacityMin is null. */
+  readonly seatsToConfirm: number | null;
   readonly participantCount: number;
   /** WS8.5B: the USER host's own party size (irrelevant/0 for provider-hosted events). */
   readonly hostGuestCount: number;

@@ -42,6 +42,14 @@ export class CreateEventDto {
   @Max(10_000)
   capacityMax!: number;
 
+  /** Group Formation: minimum physical people before the Event is confirmed. Omitted/null = no minimum; must not exceed capacityMax (checked in EventsService). */
+  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== null)
+  @IsInt()
+  @Min(1)
+  @Max(10_000)
+  capacityMin?: number | null;
+
   /** WS8.5B: the USER host's own party size (1 + hostGuestCount seats). DRAFT-only editable; frozen at publish. */
   @IsOptional()
   @IsInt()

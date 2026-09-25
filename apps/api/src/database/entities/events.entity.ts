@@ -102,6 +102,16 @@ export class EventEntity {
   @Column({ type: 'integer', name: 'capacity_max' })
   capacityMax!: number;
 
+  /**
+   * Group Formation: optional minimum TOTAL physical people (same unit as
+   * capacityMax) before the Event is presented as confirmed. NULL = no
+   * minimum. Never a lifecycle status — see event-group-state.ts for the
+   * derived FORMING/CONFIRMED presentation. events_capacity_min_chk keeps it
+   * within [1, capacityMax].
+   */
+  @Column({ type: 'integer', name: 'capacity_min', nullable: true })
+  capacityMin!: number | null;
+
   /** Trigger-maintained (tw_sync_participant_count) — never write.
    * Registered-membership count only: how many EventParticipant rows are
    * active. Unchanged meaning (WS8.5B deliberately does not redefine this)
