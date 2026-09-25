@@ -4,6 +4,9 @@ import { AuthModule } from '../auth';
 import { DatabaseModule } from '../database/database.module';
 import { realtimeModule } from '../realtime-wiring';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatInboxController } from './chat-inbox.controller';
+import { ChatInboxRepository } from './chat-inbox.repository';
+import { ChatInboxService } from './chat-inbox.service';
 import { ChatController } from './chat.controller';
 import { ChatRepository } from './chat.repository';
 import { ChatService } from './chat.service';
@@ -14,8 +17,10 @@ import { ChatService } from './chat.service';
   // second RealtimeGateway/ConnectionTracker/authenticator; it reuses the
   // exact object AppModule also imports.
   imports: [AuthModule, DatabaseModule, realtimeModule],
-  controllers: [ChatController],
-  providers: [ChatRepository, ChatBroadcastService, ChatService],
+  // ChatInboxController (Step 4) is read-only and shares the chat/rooms
+  // prefix; it never touches ChatController's send/read semantics.
+  controllers: [ChatController, ChatInboxController],
+  providers: [ChatRepository, ChatBroadcastService, ChatService, ChatInboxRepository, ChatInboxService],
   // ChatRepository is exported alongside ChatService for the WS5 EVENT
   // integration: JoinRequestsService (EventsModule) needs the raw
   // ensureEventRoom/activateEventMember primitives directly, inside its own
