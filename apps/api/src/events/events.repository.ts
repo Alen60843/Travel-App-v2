@@ -3,6 +3,7 @@ import type { DeepPartial, EntityManager } from 'typeorm';
 import { DataSource } from 'typeorm';
 
 import { EventCategoryEntity, EventEntity } from '../database/entities';
+import { EVENT_MANAGED_BY_USER_SQL } from './event-management';
 
 @Injectable()
 export class EventsRepository {
@@ -12,17 +13,13 @@ export class EventsRepository {
     return this.dataSource.transaction(work);
   }
 
+  /** Every Event the user manages (see event-management.ts): own USER-hosted Events and owned Provider sessions. */
   findOwnedEvents(userId: string): Promise<EventEntity[]> {
     return this.dataSource
       .getRepository(EventEntity)
       .createQueryBuilder('event')
       .innerJoinAndSelect('event.category', 'category')
-      .where(
-        `event.host_type = 'USER'
-         AND event.host_user_id = :userId
-         AND event.host_provider_id IS NULL`,
-        { userId },
-      )
+      .where(EVENT_MANAGED_BY_USER_SQL, { userId })
       .orderBy('event.created_at', 'DESC')
       .addOrderBy('event.id', 'ASC')
       .getMany();
@@ -38,13 +35,7 @@ export class EventsRepository {
       .getRepository(EventEntity)
       .createQueryBuilder('event')
       .innerJoinAndSelect('event.category', 'category')
-      .where(
-        `event.id = :eventId
-         AND event.host_type = 'USER'
-         AND event.host_user_id = :userId
-         AND event.host_provider_id IS NULL`,
-        { eventId, userId },
-      );
+      .where(`event.id = :eventId AND ${EVENT_MANAGED_BY_USER_SQL}`, { eventId, userId });
     if (lock) query.setLock('pessimistic_write', undefined, ['event']);
     return query.getOne();
   }

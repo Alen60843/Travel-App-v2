@@ -197,7 +197,7 @@ describe('WS5 EVENT chat provisioning on approval', () => {
 
   function buildApprovableEvent() {
     return {
-      id: eventId, hostUserId, joinApprovalRequired: true,
+      id: eventId, hostType: 'USER', hostUserId, joinApprovalRequired: true,
       status: 'ACTIVE', participantCount: 0, capacityMax: 10,
       hostGuestCount: 0, reservedSeatCount: 1, // WS8.5C: host alone, plenty of room
       minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
@@ -377,6 +377,102 @@ describe('WS5 EVENT chat provisioning on approval', () => {
     expect(eventRepository.update).not.toHaveBeenCalled();
   });
 
+  describe('Group Formation Step 2: provider-hosted session', () => {
+    const providerOwnerId = 'provider-owner-user';
+    const providerId = 'provider-1';
+
+    // Typed as the shared USER fixture only so the existing builders accept it;
+    // hostUserId is genuinely null on a PROVIDER row.
+    function buildProviderSession(overrides: Record<string, unknown> = {}): ReturnType<typeof buildApprovableEvent> {
+      return {
+        ...buildApprovableEvent(),
+        hostType: 'PROVIDER', hostUserId: null, hostProviderId: providerId,
+        reservedSeatCount: 0, // no host seat on a provider session
+        ...overrides,
+      } as unknown as ReturnType<typeof buildApprovableEvent>;
+    }
+
+    function withProviderOwner(manager: EntityManager, ownerUserId: string | null) {
+      const query = jest.fn(async (sql: string) =>
+        (/FROM providers/.test(sql) ? [{ owner_user_id: ownerUserId }] : []));
+      Object.assign(manager, { query });
+      return query;
+    }
+
+    it('manual approval by the provider owner activates the OWNER (never the Provider row) as chat host', async () => {
+      const calls: string[] = [];
+      const event = buildProviderSession();
+      const chat = mockChat();
+      const { manager } = buildManager(calls, event, chat);
+      const events = buildEventsRepository(manager, event);
+      const service = new JoinRequestsService(events as unknown as EventsRepository, chat as unknown as ChatRepository);
+
+      await service.approve(providerOwnerId, eventId, 'request-1');
+
+      expect(events.findOwnedEvent).toHaveBeenCalledWith(manager, providerOwnerId, eventId, true);
+      expect(chat.activateEventMember.mock.calls.map((call) => call[2])).toEqual([
+        providerOwnerId, participantUserId,
+      ]);
+      expect(calls).not.toContain(`activateEventMember:${roomId}:${providerId}`);
+    });
+
+    it('auto-approval resolves providers.owner_user_id as the chat host', async () => {
+      const calls: string[] = [];
+      const event = buildProviderSession({ joinApprovalRequired: false });
+      const chat = mockChat();
+      const { manager, requestRepository } = buildManager(calls, event, chat);
+      requestRepository.findOne.mockResolvedValue(null as never);
+      const query = withProviderOwner(manager, providerOwnerId);
+      const service = new JoinRequestsService(
+        buildEventsRepository(manager, event) as unknown as EventsRepository,
+        chat as unknown as ChatRepository,
+      );
+
+      await service.create(participantUserId, eventId, { message: null, guestCount: 3 });
+
+      expect(query).toHaveBeenCalledWith(expect.stringMatching(/FROM providers/), [providerId]);
+      expect(chat.activateEventMember.mock.calls.map((call) => call[2])).toEqual([
+        providerOwnerId, participantUserId,
+      ]);
+    });
+
+    it('the provider owner cannot join their own session as a participant', async () => {
+      const calls: string[] = [];
+      const event = buildProviderSession();
+      const chat = mockChat();
+      const { manager, requestRepository } = buildManager(calls, event, chat);
+      requestRepository.findOne.mockResolvedValue(null as never);
+      withProviderOwner(manager, providerOwnerId);
+      const service = new JoinRequestsService(
+        buildEventsRepository(manager, event) as unknown as EventsRepository,
+        chat as unknown as ChatRepository,
+      );
+
+      await expect(service.create(providerOwnerId, eventId, { message: null })).rejects.toMatchObject({
+        code: 'EVENT_SELF_JOIN',
+      });
+      expect(calls).toEqual([]);
+    });
+
+    it('an unclaimed provider session (owner_user_id NULL) is not joinable and provisions no chat', async () => {
+      const calls: string[] = [];
+      const event = buildProviderSession({ joinApprovalRequired: false });
+      const chat = mockChat();
+      const { manager } = buildManager(calls, event, chat);
+      withProviderOwner(manager, null);
+      const service = new JoinRequestsService(
+        buildEventsRepository(manager, event) as unknown as EventsRepository,
+        chat as unknown as ChatRepository,
+      );
+
+      await expect(service.create(participantUserId, eventId, { message: null })).rejects.toBeInstanceOf(
+        EventNotFoundError,
+      );
+      expect(calls).toEqual([]);
+      expect(chat.ensureEventRoom).not.toHaveBeenCalled();
+    });
+  });
+
   it('ChatRepository is declared as a real constructor dependency of JoinRequestsService (Nest DI wiring)', () => {
     const paramTypes = Reflect.getMetadata('design:paramtypes', JoinRequestsService) as unknown[];
     expect(paramTypes).toEqual([EventsRepository, ChatRepository]);
@@ -392,7 +488,7 @@ describe('WS8.4B participant leave / organizer remove', () => {
 
   function buildEvent(overrides: Record<string, unknown> = {}) {
     return {
-      id: eventId, hostUserId, status: 'ACTIVE',
+      id: eventId, hostType: 'USER', hostUserId, status: 'ACTIVE',
       participantCount: 5, capacityMax: 10,
       // WS8.5B: hostGuestCount=0 -> reservedSeatCount mirrors participantCount
       // by default in these fixtures (one seat per participant, no guests) —
@@ -876,7 +972,7 @@ describe('WS8.5B party size / guest seats', () => {
 
   function buildEvent(overrides: Record<string, unknown> = {}) {
     return {
-      id: eventId, hostUserId, joinApprovalRequired: true,
+      id: eventId, hostType: 'USER', hostUserId, joinApprovalRequired: true,
       status: 'ACTIVE', capacityMax: 10, reservedSeatCount: 8,
       minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
       ...overrides,
@@ -1355,7 +1451,7 @@ describe("JoinRequestsService.create() — live request scope (real-Postgres cor
 
   function buildEvent(overrides: Record<string, unknown> = {}) {
     return {
-      id: eventId, hostUserId, joinApprovalRequired: true,
+      id: eventId, hostType: 'USER', hostUserId, joinApprovalRequired: true,
       status: 'ACTIVE', capacityMax: 10, reservedSeatCount: 1,
       minTrustScore: 0, depositMinor: 0, startsAt: new Date(Date.now() + 60_000),
       ...overrides,

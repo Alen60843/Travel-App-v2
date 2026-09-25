@@ -188,6 +188,14 @@ export class EventsService {
       const hostGuestCount = dto.hostGuestCount ?? event.hostGuestCount;
       assertEventInteger(hostGuestCount, 'hostGuestCount', 0, 9999);
       this.assertHostPartyFits(hostGuestCount, capacityMax);
+      if (event.hostType === EventHostType.Provider && hostGuestCount !== 0) {
+        // The provider owner manages the session but brings no party of
+        // their own; host seats exist only for USER-hosted Events.
+        throw new InvalidEventValueError(
+          'hostGuestCount',
+          'A provider-hosted session has no host party; hostGuestCount must be 0.',
+        );
+      }
       const priceMinor = dto.priceMinor ?? event.priceMinor;
       const depositMinor = dto.depositMinor ?? event.depositMinor;
       assertEventMoney(priceMinor, depositMinor);
@@ -266,8 +274,11 @@ export class EventsService {
       // check, not a race-prone read. A host party that alone fills
       // capacityMax must publish straight to FULL rather than incorrectly
       // advertising the Event as joinable (DRAFT -> FULL is now an allowed
-      // transition — see EVENT_STATUS_TRANSITIONS).
-      const hostPartyFillsCapacity = 1 + event.hostGuestCount === event.capacityMax;
+      // transition — see EVENT_STATUS_TRANSITIONS). A PROVIDER-hosted session
+      // has no host party at all (its owner manages it but occupies no seat;
+      // reservedSeatCount starts at 0), so it always publishes as ACTIVE.
+      const hostPartyFillsCapacity =
+        event.hostType === EventHostType.User && 1 + event.hostGuestCount === event.capacityMax;
       event.status = hostPartyFillsCapacity ? EventStatus.Full : EventStatus.Active;
       event.category = category;
       return this.toEventView(await this.repository.saveEvent(manager, event), category);

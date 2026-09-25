@@ -12,6 +12,7 @@ import {
   EventParticipantEntity, UserEntity,
 } from '../database/entities';
 import type { CreateJoinRequestDto } from './dto/create-join-request.dto';
+import { findEventManagerUserId } from './event-management';
 import { EventNotFoundError } from './events.errors';
 import { EventsRepository } from './events.repository';
 import { joinError, translateJoinConflict } from './join-requests.errors';
@@ -112,7 +113,11 @@ export class JoinRequestsService {
       throw new ValidationError('guestCount must be an integer between 0 and 9999.');
     }
     return this.command(async (manager) => {
-      const event = await this.lockEvent(manager, eventId);
+      const { event, managerUserId } = await this.lockEvent(manager, eventId);
+      // Group Formation Step 2: a session nobody can manage (unclaimed or
+      // deleted Provider) is not operational — no host could ever decide a
+      // request or own the chat — so it is indistinguishable from not found.
+      if (managerUserId === null) throw new EventNotFoundError();
       const requests = manager.getRepository(EventJoinRequestEntity);
       // WS8.4B/real-Postgres correction: only a PENDING request is "live" —
       // matches event_join_requests_pending_uk (WHERE status = 'PENDING'),
@@ -132,7 +137,7 @@ export class JoinRequestsService {
       // Validation failures are returned so any expiry above commits. No new
       // request/participant has been written at this point.
       try {
-        await this.requireEligibleUser(manager, userId, event);
+        await this.requireEligibleUser(manager, userId, event, managerUserId);
         this.assertJoinable(event);
         // WS8.5C: deliberately NO capacity/party-fit check here — a Join
         // Request may now be created even when it exceeds current remaining
@@ -176,7 +181,7 @@ export class JoinRequestsService {
       if (!event.joinApprovalRequired && fitsNow) {
         // Always UPDATE from PENDING: the existing payment guard is an UPDATE
         // trigger. Auto-approval records approval time, but no host decision.
-        await this.approveAndParticipate(manager, event, request, null, userId);
+        await this.approveAndParticipate(manager, event, request, null, userId, managerUserId);
         // Re-read: auto-approval just changed reservedSeatCount (and
         // possibly status) via triggers that the in-memory `event` object
         // does not reflect.
@@ -222,7 +227,7 @@ export class JoinRequestsService {
       // locking in the same event -> request order as approval and lifecycle.
       const located = await requests.findOneBy({ id: requestId, userId });
       if (!located) throw joinError('JOIN_REQUEST_NOT_FOUND');
-      const event = await this.lockEvent(manager, located.eventId);
+      const { event } = await this.lockEvent(manager, located.eventId);
       const request = await requests.findOne({
         where: { id: requestId, userId, eventId: located.eventId },
         lock: { mode: 'pessimistic_write' },
@@ -247,15 +252,18 @@ export class JoinRequestsService {
 
   /**
    * Self-leave. The authenticated user is always the participant leaving —
-   * never taken from a body. The USER host has no EventParticipant row at
+   * never taken from a body. The Event's manager (USER host, or the
+   * Provider owner of a provider session) has no EventParticipant row at
    * all (see approveAndParticipate) and must not be able to "leave" their
    * own Event through this participant-shaped action; they have Event
    * cancellation/management semantics instead (HOST_CANNOT_LEAVE_...).
+   * Leaving stays available even when a provider session has lost its
+   * owner: it only ever gives a traveller's own seat back.
    */
   async leave(userId: string, eventId: string): Promise<MembershipView> {
     return this.command(async (manager) => {
-      const event = await this.lockEvent(manager, eventId);
-      if (event.hostUserId === userId) return joinError('HOST_CANNOT_LEAVE_VIA_PARTICIPANT_ENDPOINT');
+      const { event, managerUserId } = await this.lockEvent(manager, eventId);
+      if (managerUserId === userId) return joinError('HOST_CANNOT_LEAVE_VIA_PARTICIPANT_ENDPOINT');
       const window = this.assertLeavable(event);
       if (window) return window;
       return this.cancelParticipation(
@@ -265,9 +273,10 @@ export class JoinRequestsService {
   }
 
   /**
-   * Organizer remove. Only the exact USER host who owns eventId may call
-   * this (requireOwnedEvent both authorizes AND locks in one query, same
-   * as decide()); the host cannot target themselves — hosts are never
+   * Organizer remove. Only the exact manager of eventId (USER host, or the
+   * owner of the hosting Provider) may call this (requireOwnedEvent both
+   * authorizes AND locks in one query, same as decide()); the manager cannot
+   * target themselves — managers are never
    * EventParticipant rows to begin with, so "removing" the host is not a
    * meaningful participant action.
    */
@@ -416,7 +425,7 @@ export class JoinRequestsService {
       if (approve) {
         let eligibilityFailure: AppError | null = null;
         try {
-          await this.requireEligibleUser(manager, request.userId, event);
+          await this.requireEligibleUser(manager, request.userId, event, userId);
         } catch (error) {
           if (!(error instanceof AppError)) throw error;
           eligibilityFailure = error;
@@ -434,7 +443,8 @@ export class JoinRequestsService {
         // `event` was read fresh under requireOwnedEvent's pessimistic lock
         // at the top of this transaction, so reservedSeatCount is current.
         this.assertPartyFits(event, request.guestCount);
-        await this.approveAndParticipate(manager, event, request, userId, userId);
+        // requireOwnedEvent just proved userId IS the Event's manager.
+        await this.approveAndParticipate(manager, event, request, userId, userId, userId);
         currentEvent = await manager.getRepository(EventEntity).findOneByOrFail({ id: event.id });
       } else {
         request.status = JoinRequestStatus.Rejected;
@@ -450,8 +460,8 @@ export class JoinRequestsService {
    * WS8.5C: explicit, organizer-only approval of a party that does NOT fit
    * current remaining capacity — visibly distinct from ordinary approve().
    * Only this action may ever raise capacityMax; ordinary approve() never
-   * does. Same authorization (requireOwnedEvent — exact USER host, same
-   * lock) and lifecycle protections (pendingFailure, requireEligibleUser,
+   * does. Same authorization (requireOwnedEvent — the exact Event manager,
+   * same lock) and lifecycle protections (pendingFailure, requireEligibleUser,
    * assertJoinable) as ordinary approval; the only behavioral difference is
    * what happens when the party does not fit.
    */
@@ -476,7 +486,7 @@ export class JoinRequestsService {
 
       let eligibilityFailure: AppError | null = null;
       try {
-        await this.requireEligibleUser(manager, request.userId, event);
+        await this.requireEligibleUser(manager, request.userId, event, hostUserId);
       } catch (error) {
         if (!(error instanceof AppError)) throw error;
         eligibilityFailure = error;
@@ -494,7 +504,7 @@ export class JoinRequestsService {
         // override happened, so no override audit evidence is written;
         // capacityMax is never touched. Never fabricate override evidence
         // merely because the request originally exceeded capacity.
-        await this.approveAndParticipate(manager, event, request, hostUserId, hostUserId);
+        await this.approveAndParticipate(manager, event, request, hostUserId, hostUserId, hostUserId);
         const currentEvent = await manager.getRepository(EventEntity).findOneByOrFail({ id: event.id });
         return this.view(request, currentEvent);
       }
@@ -521,13 +531,27 @@ export class JoinRequestsService {
       // approveAndParticipate's own request.save() persists the override
       // fields set above together with status=APPROVED in one write — see
       // its own body.
-      await this.approveAndParticipate(manager, event, request, hostUserId, hostUserId);
+      await this.approveAndParticipate(manager, event, request, hostUserId, hostUserId, hostUserId);
       const currentEvent = await manager.getRepository(EventEntity).findOneByOrFail({ id: event.id });
       return this.view(request, currentEvent);
     });
   }
 
-  private async approveAndParticipate(manager: EntityManager, event: EventEntity, request: EventJoinRequestEntity, decidedBy: string | null, actor: string): Promise<void> {
+  /**
+   * `managerUserId` is the Event's resolved manager (event-management.ts
+   * rule): the USER host, or the hosting Provider's owner.
+   * It becomes the host-side EVENT chat member. It is always non-null here —
+   * create() refuses sessions without a manager and every host action is
+   * gated by requireOwnedEvent — and never taken from a request body.
+   */
+  private async approveAndParticipate(
+    manager: EntityManager,
+    event: EventEntity,
+    request: EventJoinRequestEntity,
+    decidedBy: string | null,
+    actor: string,
+    managerUserId: string,
+  ): Promise<void> {
     request.status = JoinRequestStatus.Approved;
     request.approvedAt = new Date();
     request.decidedByUserId = decidedBy;
@@ -542,18 +566,15 @@ export class JoinRequestsService {
     });
     // WS5: EVENT chat provisioning, inside this same transaction/manager —
     // never a separate one. Both manual and auto approval reach this single
-    // method, so both always end up with identical chat state. The host has
-    // no EventParticipant row in Phase 6 (see events.service.ts), so their
-    // chat membership can only be established here; event.hostUserId is the
-    // server-authoritative host identity, never taken from a request body.
-    // Any failure below throws and rolls back the whole approval.
-    // lockEvent/requireOwnedEvent only ever select USER-hosted events
-    // (hostType: User, hostProviderId: IsNull()), so hostUserId is always
-    // set here; the entity's wider `string | null` type just doesn't carry
-    // that narrowing across the query boundary.
-    if (!event.hostUserId) throw new Error('USER-hosted event unexpectedly has no hostUserId');
+    // method, so both always end up with identical chat state. The manager
+    // has no EventParticipant row (see events.service.ts), so their chat
+    // membership can only be established here. Group Formation Step 2: for
+    // a PROVIDER session that manager is providers.owner_user_id — the
+    // Provider row itself is never a chat user, and party guests (guest_count)
+    // are headcount only, never chat members. Any failure below throws and
+    // rolls back the whole approval.
     const roomId = await this.chat.ensureEventRoom(manager, event.id);
-    await this.chat.activateEventMember(manager, roomId, event.hostUserId);
+    await this.chat.activateEventMember(manager, roomId, managerUserId);
     await this.chat.activateEventMember(manager, roomId, request.userId);
     // Re-read the trigger-maintained counters; never calculate or write them
     // here. WS8.5B: FULL now follows physical seat occupancy
@@ -565,8 +586,15 @@ export class JoinRequestsService {
     }
   }
 
-  private async requireEligibleUser(manager: EntityManager, userId: string, event: EventEntity): Promise<void> {
-    if (event.hostUserId === userId) throw joinError('EVENT_SELF_JOIN');
+  private async requireEligibleUser(
+    manager: EntityManager,
+    userId: string,
+    event: EventEntity,
+    managerUserId: string,
+  ): Promise<void> {
+    // The Event's manager (USER host or Provider owner) can never also be a
+    // participant of the same Event.
+    if (managerUserId === userId) throw joinError('EVENT_SELF_JOIN');
     const user = await manager.getRepository(UserEntity).findOne({
       where: { id: userId }, lock: { mode: 'pessimistic_read' },
     });
@@ -610,13 +638,27 @@ export class JoinRequestsService {
     if (requestedSeats > remainingSeats) throw joinError('EVENT_CAPACITY_OVERRIDE_REQUIRED');
   }
 
-  private async lockEvent(manager: EntityManager, eventId: string): Promise<EventEntity> {
+  /**
+   * Traveller-side lookup (create / cancel / leave): locks any USER-hosted
+   * Event or PROVIDER-hosted session and resolves its manager through the
+   * single event-management.ts rule. `managerUserId` is null only for a
+   * provider session nobody can manage (unclaimed or deleted Provider);
+   * each caller decides what that means for its own action. Grants no
+   * management rights — host actions go through requireOwnedEvent.
+   */
+  private async lockEvent(
+    manager: EntityManager,
+    eventId: string,
+  ): Promise<{ event: EventEntity; managerUserId: string | null }> {
     const event = await manager.getRepository(EventEntity).findOne({
-      where: { id: eventId, hostType: EventHostType.User, hostProviderId: IsNull() },
+      where: [
+        { id: eventId, hostType: EventHostType.User, hostProviderId: IsNull() },
+        { id: eventId, hostType: EventHostType.Provider, hostUserId: IsNull() },
+      ],
       lock: { mode: 'pessimistic_write' },
     });
     if (!event) throw new EventNotFoundError();
-    return event;
+    return { event, managerUserId: await findEventManagerUserId(manager, event) };
   }
 
   private async requireOwnedEvent(manager: EntityManager, userId: string, eventId: string): Promise<EventEntity> {

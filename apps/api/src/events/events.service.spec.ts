@@ -374,6 +374,59 @@ describe('EventsService', () => {
     }
   });
 
+  describe('Group Formation Step 2: provider-hosted sessions', () => {
+    const PROVIDER_ID = randomUUID();
+    const providerSession = (overrides: Partial<EventEntity> = {}) =>
+      eventFixture({
+        hostType: EventHostType.Provider,
+        hostUserId: null,
+        hostProviderId: PROVIDER_ID,
+        hostGuestCount: 0,
+        reservedSeatCount: 0,
+        ...overrides,
+      });
+
+    it('publishes a one-seat provider session as ACTIVE: the owner occupies no seat', async () => {
+      repository.findOwnedEvent.mockResolvedValue(providerSession({ capacityMax: 1 }));
+
+      const published = await service.publishEvent(USER_ID, EVENT_ID, NOW);
+
+      expect(published.status).toBe(EventStatus.Active);
+      expect(repository.setTransitionContext).toHaveBeenCalledWith(manager, USER_ID, 'host_publish');
+    });
+
+    it('still publishes a one-seat USER-hosted Event straight to FULL (host takes the seat)', async () => {
+      repository.findOwnedEvent.mockResolvedValue(eventFixture({ capacityMax: 1 }));
+
+      await expect(service.publishEvent(USER_ID, EVENT_ID, NOW)).resolves.toMatchObject({
+        status: EventStatus.Full,
+      });
+    });
+
+    it('rejects giving a provider session a host party', async () => {
+      repository.findOwnedEvent.mockResolvedValue(providerSession());
+
+      await expect(
+        service.updateEvent(USER_ID, EVENT_ID, { hostGuestCount: 2 }),
+      ).rejects.toMatchObject({ details: { field: 'hostGuestCount' } });
+      expect(repository.saveEvent).not.toHaveBeenCalled();
+    });
+
+    it('serializes a fresh provider session as FORMING from 0 reserved seats', async () => {
+      repository.findOwnedEventView.mockResolvedValue(
+        providerSession({ status: EventStatus.Active, capacityMin: 8, capacityMax: 12 }),
+      );
+
+      await expect(service.getEvent(USER_ID, EVENT_ID)).resolves.toMatchObject({
+        hostType: EventHostType.Provider,
+        reservedSeatCount: 0,
+        groupState: 'FORMING',
+        seatsToConfirm: 8,
+        remainingSeats: 12,
+      });
+    });
+  });
+
   describe('Group Formation: capacityMin', () => {
     it('persists an explicit capacityMin and serializes it with its derived fields', async () => {
       const result = await service.createEvent(
