@@ -1,0 +1,21 @@
+# Expo / Metro local state (generated)
+.expo/
+expo-env.d.ts
+web-build/
+dist/
+
+# Native projects are generated on demand (Expo prebuild); not committed yet
+/ios
+/android
+
+# Local environment — copy .env.example to .env.local
+.env
+.env.local
+.env.*.local
+
+# Native signing material must never be committed
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision

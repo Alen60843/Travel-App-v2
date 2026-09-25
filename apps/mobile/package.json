@@ -1,0 +1,30 @@
+{
+  "name": "@tripwith/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "pnpm --filter @tripwith/shared build && expo start",
+    "android": "pnpm --filter @tripwith/shared build && expo start --android",
+    "ios": "pnpm --filter @tripwith/shared build && expo start --ios",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "config:check": "expo config --type public --json"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.103.2",
+    "@tripwith/shared": "workspace:*",
+    "expo": "~57.0.25",
+    "expo-constants": "~57.0.19",
+    "expo-linking": "~57.0.11",
+    "expo-router": "~57.0.23",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0"
+  },
+  "devDependencies": {
+    "@expo/ngrok": "^4.1.0",
+    "@types/react": "~19.2.4"
+  }
+}

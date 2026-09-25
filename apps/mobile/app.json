@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "TripWith",
+    "slug": "tripwith",
+    "scheme": "tripwith",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
